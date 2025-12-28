@@ -1,0 +1,5 @@
+/GEMINI.md
+.idea
+/GPT_SoVITS/pretrained_models/
+*.onnx
+*.zip
