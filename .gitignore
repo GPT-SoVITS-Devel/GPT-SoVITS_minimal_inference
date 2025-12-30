@@ -3,3 +3,6 @@
 /GPT_SoVITS/pretrained_models/
 *.onnx
 *.zip
+*.wav
+/onnx
+/pretrained_models

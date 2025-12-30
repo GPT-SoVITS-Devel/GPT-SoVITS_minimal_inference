@@ -9,7 +9,7 @@ from torch.nn import functional as F
 from torchmetrics.classification import MulticlassAccuracy
 from tqdm import tqdm
 
-from AR.models.utils import (
+from GPT_SoVITS.AR.models.utils import (
     dpo_loss,
     get_batch_logps,
     make_pad_mask,
@@ -18,8 +18,8 @@ from AR.models.utils import (
     sample,
     topk_sampling,
 )
-from AR.modules.embedding import SinePositionalEmbedding, TokenEmbedding
-from AR.modules.transformer import LayerNorm, TransformerEncoder, TransformerEncoderLayer
+from GPT_SoVITS.AR.modules.embedding import SinePositionalEmbedding, TokenEmbedding
+from GPT_SoVITS.AR.modules.transformer import LayerNorm, TransformerEncoder, TransformerEncoderLayer
 
 default_config = {
     "embedding_dim": 512,
@@ -70,7 +70,6 @@ def scaled_dot_product_attention(
     return attn_weight @ value
 
 
-@torch.jit.script
 class T2SMLP:
     def __init__(self, w1, b1, w2, b2):
         self.w1 = w1
@@ -84,7 +83,6 @@ class T2SMLP:
         return x
 
 
-@torch.jit.script
 class T2SBlock:
     def __init__(
         self,
@@ -221,11 +219,12 @@ class T2SBlock:
         return x, k_cache, v_cache
 
 
-@torch.jit.script
-class T2STransformer:
+class T2STransformer(nn.Module):
     def __init__(self, num_blocks: int, blocks: List[T2SBlock]):
+        super().__init__()
         self.num_blocks: int = num_blocks
         self.blocks = blocks
+
 
     def process_prompt(
         self,
@@ -977,3 +976,64 @@ class Text2SemanticDecoder(nn.Module):
         return next(self.infer_panel_naive(
             x, x_lens, prompts, bert_feature, top_k, top_p, early_stop_num, temperature, repetition_penalty, **kwargs
         ))
+
+    def infer_first_stage(
+        self,
+        x: torch.LongTensor,
+        x_lens: torch.LongTensor,
+        prompts: torch.LongTensor,
+        bert_feature: torch.LongTensor,
+    ):
+        x = self.ar_text_embedding(x)
+        x = x + self.bert_proj(bert_feature.transpose(1, 2))
+        x = self.ar_text_position(x)
+
+        y = prompts
+        y_emb = self.ar_audio_embedding(y)
+        y_len = y_emb.shape[1]
+        y_pos = self.ar_audio_position(y_emb)
+        xy_pos = torch.concat([x, y_pos], dim=1)
+
+        x_len = x.shape[1]
+        
+        # x_attn_mask_pad: [x_len, x_len + y_len]
+        # Left part: [x_len, x_len] zeros (False)
+        # Right part: [x_len, y_len] ones (True)
+        x_attn_mask = torch.zeros((x_len, x_len), dtype=torch.bool, device=x.device)
+        x_attn_mask_pad = F.pad(x_attn_mask, (0, y_len), value=True)
+
+        # y_attn_mask: [y_len, x_len + y_len]
+        # Left part: [y_len, x_len] zeros (False)
+        # Right part: [y_len, y_len] triu (diagonal=1)
+        y_right = torch.triu(torch.ones((y_len, y_len), dtype=torch.bool, device=x.device), diagonal=1)
+        y_attn_mask = F.pad(y_right, (x_len, 0), value=False)
+
+        xy_attn_mask = torch.concat([x_attn_mask_pad, y_attn_mask], dim=0)
+        
+        xy_dec, k_cache, v_cache = self.t2s_transformer.process_prompt(xy_pos, xy_attn_mask, None)
+        
+        logits = self.ar_predict_layer(xy_dec[:, -1])
+        
+        return logits, k_cache, v_cache, x_len, y_len
+
+    def infer_next_stage(
+        self,
+        samples: torch.Tensor, # (B, 1)
+        k_cache: List[torch.Tensor],
+        v_cache: List[torch.Tensor],
+        x_len: int,
+        y_len: int,
+        idx: int, # current step index starting from 0 (relative to generated)
+    ):
+        y_emb = self.ar_audio_embedding(samples)
+        # Calculate position encoding
+        # In loop: xy_pos = y_emb * scale + alpha * pe[:, y_len + idx]
+        pos = y_len + idx
+        if isinstance(pos, torch.Tensor):
+            pos = pos.view(-1)
+        xy_pos = y_emb * self.ar_audio_position.x_scale + self.ar_audio_position.alpha * self.ar_audio_position.pe.index_select(1, pos).to(dtype=y_emb.dtype, device=y_emb.device)
+
+        xy_dec, k_cache, v_cache = self.t2s_transformer.decode_next_token(xy_pos, k_cache, v_cache)
+        logits = self.ar_predict_layer(xy_dec[:, -1])
+        
+        return logits, k_cache, v_cache

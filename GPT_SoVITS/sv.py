@@ -4,7 +4,7 @@ os.environ["PATH"] = fr'D:\SDK\c++\ffmpeg\bin:{os.environ["PATH"]}'
 import torch
 
 sys.path.append(f"{os.getcwd()}/GPT_SoVITS/eres2net")
-sv_path = os.environ.get("SV_MODEL_PATH", "GPT_SoVITS/pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt")
+sv_path = os.environ.get("SV_MODEL_PATH", "pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt")
 from ERes2NetV2 import ERes2NetV2
 import kaldi as Kaldi
 
@@ -28,6 +28,6 @@ class SV:
                 wav = wav.half()
             feat = torch.stack(
                 [Kaldi.fbank(wav0.unsqueeze(0), num_mel_bins=80, sample_frequency=16000, dither=0) for wav0 in wav]
-            )
+            ).to(next(self.embedding_model.parameters()).device)
             sv_emb = self.embedding_model.forward3(feat)
         return sv_emb

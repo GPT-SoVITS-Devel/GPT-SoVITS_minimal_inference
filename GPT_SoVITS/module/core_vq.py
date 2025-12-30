@@ -39,8 +39,8 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from module.distrib import broadcast_tensors, is_distributed
-from module.ddp_utils import SyncFunction
+from GPT_SoVITS.module.distrib import broadcast_tensors, is_distributed
+from GPT_SoVITS.module.ddp_utils import SyncFunction
 from tqdm import tqdm
 
 

@@ -26,7 +26,7 @@ from GPT_SoVITS.text.cleaner import clean_text
 from GPT_SoVITS.feature_extractor import cnhubert
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 from GPT_SoVITS.module.mel_processing import spectrogram_torch
-from GPT_SoVITS.process_ckpt import load_sovits_new
+from GPT_SoVITS.process_ckpt import load_sovits_new, get_sovits_version_from_path_fast
 from GPT_SoVITS.sv import SV
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -98,14 +98,8 @@ class GPTSoVITSInference:
         self.hps.model.semantic_frame_rate = "25hz"
 
         # Determine version
-        if "sv_emb.weight" in dict_s2["weight"]:
-            self.hps.model.version = "v2Pro"
-        elif "enc_p.text_embedding.weight" not in dict_s2["weight"]:
-            self.hps.model.version = "v2"
-        elif dict_s2["weight"]["enc_p.text_embedding.weight"].shape[0] == 322:
-            self.hps.model.version = "v1"
-        else:
-            self.hps.model.version = "v2"
+        _, model_version, _ = get_sovits_version_from_path_fast(sovits_path)
+        self.hps.model.version = model_version
 
         # Check for Pro/Plus
         # Heuristic: User should provide v2 models as requested.
