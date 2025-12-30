@@ -75,10 +75,19 @@ class GPTSoVITS_ONNX_Inference:
         _, self.version, _ = get_sovits_version_from_path_fast(sovits_path)
         print(f"Detected model version: {self.version}")
         
+        # Ensure hps matches what was used during export
+        self.hps["model"]["version"] = self.version
+        self.hps["model"]["semantic_frame_rate"] = "25hz"
+        
         # Load SV model (PyTorch for now as it's not in ONNX)
         self.sv_model = SV(device, False)
 
-    def get_bert_feature(self, text, word2ph):
+    def get_bert_feature(self, text, word2ph, language):
+        if language != "zh":
+            # For non-zh, return zero features matching the phoneme length
+            # Note: Clean text should have been called before this to get phones
+            return None 
+
         inputs = self.tokenizer(text, return_tensors="np")
         input_ids = inputs["input_ids"].astype(np.int64)
         attention_mask = inputs["attention_mask"].astype(np.int64)
@@ -126,8 +135,12 @@ class GPTSoVITS_ONNX_Inference:
         phones2, word2ph2, norm_text2 = clean_text(text, text_lang, self.version)
         phones2 = cleaned_text_to_sequence(phones2, self.version)
         
-        bert1 = self.get_bert_feature(norm_text1, word2ph1)
-        bert2 = self.get_bert_feature(norm_text2, word2ph2)
+        bert1 = self.get_bert_feature(norm_text1, word2ph1, prompt_lang)
+        bert2 = self.get_bert_feature(norm_text2, word2ph2, text_lang)
+        
+        if bert1 is None: bert1 = np.zeros((1024, len(phones1)), dtype=np.float32)
+        if bert2 is None: bert2 = np.zeros((1024, len(phones2)), dtype=np.float32)
+        
         bert = np.concatenate([bert1, bert2], axis=1)[None, :, :].astype(np.float32)
         
         all_phoneme_ids = np.array(phones1 + phones2, dtype=np.int64)[None, :]
@@ -205,10 +218,7 @@ class GPTSoVITS_ONNX_Inference:
         
         audio = self.run_sess(self.sess_sovits, sovits_inputs)[0]
         
-        sf.write(output_path, audio.squeeze(), 32000)
-        print(f"Saved to {output_path}")
-        
-        sf.write(output_path, audio.squeeze(), 32000)
+        sf.write(output_path, audio.squeeze(), self.hps["data"]["sampling_rate"])
         print(f"Saved to {output_path}")
 
 if __name__ == "__main__":
