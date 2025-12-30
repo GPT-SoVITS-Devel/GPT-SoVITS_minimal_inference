@@ -150,9 +150,10 @@ def export_onnx(args):
             import types
             module.init_embed_ = types.MethodType(lambda self, data: None, module)
 
-    output_dir = "onnx_export"
+    output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     
+    print(f"Exporting to {output_dir}...")
     print("Exporting SSL...")
     # Input: [1, T] audio 16k
     dummy_audio = torch.randn(1, 16000*2)
@@ -301,6 +302,7 @@ if __name__ == "__main__":
     parser.add_argument("--sovits_path", required=True)
     parser.add_argument("--cnhubert_base_path", default="pretrained_models/chinese-hubert-base")
     parser.add_argument("--bert_path", default="pretrained_models/chinese-roberta-wwm-ext-large")
+    parser.add_argument("--output_dir", default="onnx_export", help="Output directory for ONNX models")
     
     args = parser.parse_args()
     export_onnx(args)
