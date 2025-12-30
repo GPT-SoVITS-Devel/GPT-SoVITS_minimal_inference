@@ -107,22 +107,44 @@ def get_sovits_version_from_path_fast(sovits_path):
         version = f.read(2)
     if version != b"PK":
         return head2version[version]
-    ###3-old weights, by file size
+    ###3-old weights, by file size and key check
     if_lora_v3 = False
     size = os.path.getsize(sovits_path)
-    """
-            v1weights:about 82942KB
-                half thr:82978KB
-            v2weights:about 83014KB
-            v3weights:about 750MB
-    """
-    if size < 82978 * 1024:
-        model_version = version = "v1"
-    elif size < 700 * 1024 * 1024:
-        model_version = version = "v2"
-    else:
-        version = "v2"
-        model_version = "v3"
+    try:
+        ckpt = load_sovits_new(sovits_path)
+        if "config" in ckpt and "model" in ckpt["config"] and "version" in ckpt["config"]["model"]:
+            model_version = ckpt["config"]["model"]["version"]
+            version = "v1" if model_version == "v1" else "v2"
+        else:
+            # Check ref_enc input dimension to distinguish v1 and v2
+            if "ref_enc.spectral.0.fc.weight" in ckpt["weight"]:
+                in_dim = ckpt["weight"]["ref_enc.spectral.0.fc.weight"].shape[1]
+                if in_dim == 704:
+                    version = "v2"
+                    model_version = "v2"
+                else:
+                    version = "v1"
+                    model_version = "v1"
+            else:
+                # Fallback to size-based detection if key is missing
+                if size < 82978 * 1024:
+                    model_version = version = "v1"
+                else:
+                    model_version = version = "v2"
+
+            # Check for Pro/Plus
+            if "sv_emb.weight" in ckpt["weight"]:
+                model_version = "v2Pro"
+    except:
+        # Final fallback to size-based detection
+        if size < 82978 * 1024:
+            model_version = version = "v1"
+        elif size < 700 * 1024 * 1024:
+            model_version = version = "v2"
+        else:
+            version = "v2"
+            model_version = "v3"
+
     return version, model_version, if_lora_v3
 
 

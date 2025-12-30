@@ -995,20 +995,22 @@ class Text2SemanticDecoder(nn.Module):
         xy_pos = torch.concat([x, y_pos], dim=1)
 
         x_len = x.shape[1]
-        
+        y_len = prompts.shape[1]
+
         # x_attn_mask_pad: [x_len, x_len + y_len]
         # Left part: [x_len, x_len] zeros (False)
         # Right part: [x_len, y_len] ones (True)
-        x_attn_mask = torch.zeros((x_len, x_len), dtype=torch.bool, device=x.device)
-        x_attn_mask_pad = F.pad(x_attn_mask, (0, y_len), value=True)
+        # Use dynamic shape-based creation to avoid baked-in sizes during ONNX export
+        x_attn_mask = x.new_zeros((x_len, x_len), dtype=torch.bool)
+        x_attn_mask_pad = torch.cat([x_attn_mask, x.new_ones((x_len, y_len), dtype=torch.bool)], dim=1)
 
         # y_attn_mask: [y_len, x_len + y_len]
         # Left part: [y_len, x_len] zeros (False)
         # Right part: [y_len, y_len] triu (diagonal=1)
-        y_right = torch.triu(torch.ones((y_len, y_len), dtype=torch.bool, device=x.device), diagonal=1)
-        y_attn_mask = F.pad(y_right, (x_len, 0), value=False)
+        y_right = torch.triu(prompts.new_ones((y_len, y_len), dtype=torch.bool), diagonal=1)
+        y_attn_mask = torch.cat([prompts.new_zeros((y_len, x_len), dtype=torch.bool), y_right], dim=1)
 
-        xy_attn_mask = torch.concat([x_attn_mask_pad, y_attn_mask], dim=0)
+        xy_attn_mask = torch.cat([x_attn_mask_pad, y_attn_mask], dim=0)
         
         xy_dec, k_cache, v_cache = self.t2s_transformer.process_prompt(xy_pos, xy_attn_mask, None)
         

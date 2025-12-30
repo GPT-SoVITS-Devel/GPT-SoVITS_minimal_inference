@@ -99,7 +99,13 @@ class GPTSoVITSInference:
 
         # Determine version
         _, model_version, _ = get_sovits_version_from_path_fast(sovits_path)
+        if "config" in dict_s2 and "model" in dict_s2["config"] and "version" in dict_s2["config"]["model"]:
+            model_version = dict_s2["config"]["model"]["version"]
+        elif "sv_emb.weight" in dict_s2["weight"]:
+            model_version = "v2Pro"
+        
         self.hps.model.version = model_version
+        print(f"Detected SoVITS model version: {model_version}")
 
         # Check for Pro/Plus
         # Heuristic: User should provide v2 models as requested.

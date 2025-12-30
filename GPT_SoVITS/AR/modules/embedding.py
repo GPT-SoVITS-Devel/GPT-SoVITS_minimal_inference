@@ -74,5 +74,6 @@ class SinePositionalEmbedding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         self.extend_pe(x)
         output = x.unsqueeze(-1) if x.ndim == 2 else x
-        output = output * self.x_scale + self.alpha * self.pe[:, : x.size(1)]
+        # Use narrow for ONNX export to keep it dynamic
+        output = output * self.x_scale + self.alpha * self.pe.narrow(1, 0, x.shape[1])
         return self.dropout(output)

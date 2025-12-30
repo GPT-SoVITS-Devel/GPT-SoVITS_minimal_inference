@@ -276,51 +276,72 @@ class MultiHeadAttention(nn.Module):
         return ret
 
     def _get_relative_embeddings(self, relative_embeddings, length):
-        max_relative_position = 2 * self.window_size + 1
-        # Pad first before slice to avoid using cond ops.
-        pad_length = max(length - (self.window_size + 1), 0)
-        slice_start_position = max((self.window_size + 1) - length, 0)
-        slice_end_position = slice_start_position + 2 * length - 1
-        if pad_length > 0:
-            padded_relative_embeddings = F.pad(
-                relative_embeddings,
-                commons.convert_pad_shape([[0, 0], [pad_length, pad_length], [0, 0]]),
-            )
+        """
+        Extracts relative embeddings for a given sequence length.
+        Ensures dynamic shape compatibility for ONNX export while maintaining Eager mode support.
+        """
+        w = self.window_size
+        device = relative_embeddings.device
+        
+        # Use tensor arithmetic to remain in the tensor graph during ONNX export
+        # but handle the 'int' length provided during Eager inference.
+        if torch.is_tensor(length):
+            l_tensor = length
         else:
-            padded_relative_embeddings = relative_embeddings
-        used_relative_embeddings = padded_relative_embeddings[:, slice_start_position:slice_end_position]
-        return used_relative_embeddings
+            l_tensor = torch.tensor(length, device=device)
+            
+        # Create indices for the target sequence: i ranges from 0 to 2*length - 2
+        # Relative position p = i - (length - 1)
+        # Embedding index j = p + w = i - length + 1 + w
+        # We use torch.arange with a tensor to ensure the op is recorded as dynamic
+        i = torch.arange(2 * l_tensor - 1, device=device)
+        j = i.float() - l_tensor.float() + 1 + w
+        
+        # Mask out-of-bounds indices (outside [0, 2*w])
+        mask = (j >= 0) & (j <= 2 * w)
+        j_clamped = torch.clamp(j, 0, 2 * w).long()
+        
+        # Extract embeddings using the clamped indices and apply the mask
+        # relative_embeddings shape: [heads, 2*w+1, d]
+        # Result shape: [heads, 2*length-1, d]
+        out = relative_embeddings[:, j_clamped, :]
+        out = out * mask.view(1, -1, 1).to(dtype=out.dtype)
+        
+        return out
 
     def _relative_position_to_absolute_position(self, x):
         """
         x: [b, h, l, 2*l-1]
         ret: [b, h, l, l]
         """
-        batch, heads, length, _ = x.size()
+        batch, heads, length, _ = x.shape
+        
         # Concat columns of pad to shift from relative to absolute indexing.
-        x = F.pad(x, commons.convert_pad_shape([[0, 0], [0, 0], [0, 0], [0, 1]]))
+        # Axis 2 (length) must match, Axis 3 is concatenated.
+        x = torch.cat([x, x.new_zeros([batch, heads, length, 1])], dim=-1)
 
         # Concat extra elements so to add up to shape (len+1, 2*len-1).
-        x_flat = x.view([batch, heads, length * 2 * length])
-        x_flat = F.pad(x_flat, commons.convert_pad_shape([[0, 0], [0, 0], [0, length - 1]]))
+        x_flat = x.view(batch, heads, -1)
+        x_flat = torch.cat([x_flat, x_flat.new_zeros([batch, heads, length - 1])], dim=-1)
 
         # Reshape and slice out the padded elements.
-        x_final = x_flat.view([batch, heads, length + 1, 2 * length - 1])[:, :, :length, length - 1 :]
-        return x_final
+        x_final = x_flat.view(batch, heads, length + 1, 2 * length - 1)
+        return x_final[:, :, :length, length - 1 :]
 
     def _absolute_position_to_relative_position(self, x):
         """
         x: [b, h, l, l]
         ret: [b, h, l, 2*l-1]
         """
-        batch, heads, length, _ = x.size()
+        batch, heads, length, _ = x.shape
+        
         # padd along column
-        x = F.pad(x, commons.convert_pad_shape([[0, 0], [0, 0], [0, 0], [0, length - 1]]))
-        x_flat = x.view([batch, heads, length**2 + length * (length - 1)])
+        x = torch.cat([x, x.new_zeros([batch, heads, length, length - 1])], dim=-1)
+        x_flat = x.view(batch, heads, -1)
         # add 0's in the beginning that will skew the elements after reshape
-        x_flat = F.pad(x_flat, commons.convert_pad_shape([[0, 0], [0, 0], [length, 0]]))
-        x_final = x_flat.view([batch, heads, length, 2 * length])[:, :, :, 1:]
-        return x_final
+        x_flat = torch.cat([x.new_zeros([batch, heads, length]), x_flat], dim=-1)
+        x_final = x_flat.view(batch, heads, length, 2 * length)
+        return x_final[:, :, :, 1:]
 
     def _attention_bias_proximal(self, length):
         """Bias for self-attention to encourage attention to close positions.

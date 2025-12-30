@@ -254,10 +254,9 @@ class TextEncoder(nn.Module):
         y_ = y
         y_mask_ = y_mask
 
-
-
         if speed != 1:
-            y = F.interpolate(y, size=int(y.shape[-1] / speed) + 1, mode="linear")
+            # Use scale_factor for better ONNX export support
+            y = F.interpolate(y, scale_factor=1.0/speed, mode="linear")
             y_mask = F.interpolate(y_mask, size=y.shape[-1], mode="nearest")
         stats = self.proj(y) * y_mask
         m, logs = torch.split(stats, self.out_channels, dim=1)
@@ -948,13 +947,14 @@ class SynthesizerTrn(nn.Module):
                 if self.freeze_quantizer:
                     self.ssl_proj.eval()
                     self.quantizer.eval()
-            ssl = self.ssl_proj(ssl)
-            quantized, codes, commit_loss, quantized_list = self.quantizer(ssl, layers=[0])
-
-        if self.semantic_frame_rate == "25hz":
-            quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
-
-        x, m_p, logs_p, y_mask, _, _ = self.enc_p(quantized, y_lengths, text, text_lengths, ge512 if self.is_v2pro else ge)
+                    ssl = self.ssl_proj(ssl)
+                    quantized, codes, commit_loss, quantized_list = self.quantizer(ssl, layers=[0])
+            
+                    if self.semantic_frame_rate == "25hz":
+                        quantized = F.interpolate(quantized, scale_factor=2.0, mode="nearest")
+            
+                    x, m_p, logs_p, y_mask, _, _ = self.enc_p(quantized, y_lengths, text, text_lengths, ge512 if self.is_v2pro else ge)
+            
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=ge)
         z_p = self.flow(z, y_mask, g=ge)
 
@@ -980,7 +980,7 @@ class SynthesizerTrn(nn.Module):
         ssl = self.ssl_proj(ssl)
         quantized, codes, commit_loss, _ = self.quantizer(ssl, layers=[0])
         if self.semantic_frame_rate == "25hz":
-            quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
+            quantized = F.interpolate(quantized, scale_factor=2.0, mode="nearest")
 
         x, m_p, logs_p, y_mask, _, _ = self.enc_p(quantized, y_lengths, text, text_lengths, ge, test=test)
         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
@@ -1017,12 +1017,15 @@ class SynthesizerTrn(nn.Module):
         else:
             ge = get_ge(refer, sv_emb)
 
-        y_lengths = torch.LongTensor([codes.size(2) * 2]).to(codes.device)
-        text_lengths = torch.LongTensor([text.size(-1)]).to(text.device)
+        # Calculate lengths dynamically from input shapes for ONNX support
+        # Using tensor operations instead of Python scalars to avoid constant-folding
+        y_lengths = torch.tensor(codes.shape[2], device=codes.device).unsqueeze(0) * 2
+        text_lengths = torch.tensor(text.shape[-1], device=text.device).unsqueeze(0)
 
         quantized = self.quantizer.decode(codes)
         if self.semantic_frame_rate == "25hz":
-            quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
+            # Use scale_factor instead of size to maintain dynamic axis in ONNX
+            quantized = F.interpolate(quantized, scale_factor=2.0, mode="nearest")
         x, m_p, logs_p, y_mask, _, _ = self.enc_p(
             quantized,
             y_lengths,
@@ -1065,12 +1068,15 @@ class SynthesizerTrn(nn.Module):
         else:
             ge = get_ge(refer, sv_emb)
 
-        y_lengths = torch.LongTensor([codes.size(2) * 2]).to(codes.device)
-        text_lengths = torch.LongTensor([text.size(-1)]).to(text.device)
+        # Calculate lengths dynamically from input shapes for ONNX support
+        # Using tensor operations instead of Python scalars to avoid constant-folding
+        y_lengths = torch.tensor(codes.shape[2], device=codes.device).unsqueeze(0) * 2
+        text_lengths = torch.tensor(text.shape[-1], device=text.device).unsqueeze(0)
 
         quantized = self.quantizer.decode(codes)
         if self.semantic_frame_rate == "25hz":
-            quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
+            # Use scale_factor instead of size to maintain dynamic axis in ONNX
+            quantized = F.interpolate(quantized, scale_factor=2.0, mode="nearest")
             result_length = (2*result_length) if result_length is not None else None
             padding_length = (2*padding_length) if padding_length is not None else None
         x, m_p, logs_p, y_mask, y_, y_mask_ = self.enc_p(
