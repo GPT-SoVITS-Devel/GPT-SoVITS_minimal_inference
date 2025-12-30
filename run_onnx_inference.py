@@ -7,6 +7,7 @@ import librosa
 import soundfile as sf
 import sys
 import torchaudio
+import time
 
 
 so = onnxruntime.SessionOptions()
@@ -81,6 +82,68 @@ class GPTSoVITS_ONNX_Inference:
         
         # Load SV model (PyTorch for now as it's not in ONNX)
         self.sv_model = SV(device, False)
+        
+        # Warm up models to avoid first-run latency
+        self.warmup()
+
+    def warmup(self):
+        print("Warming up ONNX models...")
+        # Synthetic inputs for warmup (matching export_onnx.py dummy shapes)
+        audio = np.zeros((1, 32000), dtype=np.float32)
+        input_ids = np.zeros((1, 20), dtype=np.int64)
+        attention_mask = np.ones((1, 20), dtype=np.int64)
+        token_type_ids = np.zeros((1, 20), dtype=np.int64)
+        ssl_content = np.zeros((1, 768, 100), dtype=np.float32)
+        phoneme_ids = np.zeros((1, 50), dtype=np.int64)
+        phoneme_ids_len = np.array([50], dtype=np.int64)
+        prompts = np.zeros((1, 20), dtype=np.int64)
+        bert_feature = np.zeros((1, 1024, 50), dtype=np.float32)
+        
+        # Version-specific shapes
+        spec_channels = 1025 if self.version != "v1" else 513
+        sv_emb_size = 20480 if "Pro" in self.version else 512
+        
+        # Warm up SSL, BERT, VQ
+        for _ in range(2):
+            _ = self.run_sess(self.sess_ssl, {"audio": audio})
+            _ = self.run_sess(self.sess_bert, {"input_ids": input_ids, "attention_mask": attention_mask, "token_type_ids": token_type_ids})
+            _ = self.run_sess(self.sess_vq, {"ssl_content": ssl_content})
+        
+        # Warm up GPT Encoder
+        res_enc = self.run_sess(self.sess_gpt_enc, {
+            "phoneme_ids": phoneme_ids,
+            "phoneme_ids_len": phoneme_ids_len,
+            "prompts": prompts,
+            "bert_feature": bert_feature
+        })
+        logits, k_cache, v_cache, x_len, y_len = res_enc
+        
+        # Warm up GPT Step (run a few steps)
+        samples = np.zeros((1, 1), dtype=np.int64)
+        for i in range(5):
+            res_step = self.run_sess(self.sess_gpt_step, {
+                "samples": samples,
+                "k_cache": k_cache,
+                "v_cache": v_cache,
+                "x_len": x_len,
+                "y_len": y_len,
+                "idx": np.array(i, dtype=np.int64)
+            })
+            _, k_cache, v_cache = res_step
+        
+        # Warm up SoVITS
+        pred_semantic = np.zeros((1, 1, 150), dtype=np.int64)
+        text_seq = np.zeros((1, 50), dtype=np.int64)
+        refer_spec = np.zeros((1, spec_channels, 200), dtype=np.float32)
+        sv_emb = np.zeros((1, sv_emb_size), dtype=np.float32)
+        for _ in range(2):
+            _ = self.run_sess(self.sess_sovits, {
+                "pred_semantic": pred_semantic,
+                "text_seq": text_seq,
+                "refer_spec": refer_spec,
+                "sv_emb": sv_emb
+            })
+        print("Warmup complete.")
 
     def get_bert_feature(self, text, word2ph, language):
         if language != "zh":
@@ -117,7 +180,10 @@ class GPTSoVITS_ONNX_Inference:
     def infer(self, ref_wav_path, prompt_text, prompt_lang, text, text_lang, 
               top_k=5, temperature=1.0, output_path="out.wav"):
         
+        t_total_start = time.perf_counter()
+        
         print("Processing reference audio...")
+        t_ref_start = time.perf_counter()
         wav16k, _ = librosa.load(ref_wav_path, sr=16000)
         zero_wav = np.zeros(int(16000 * 0.3), dtype=np.float32)
         wav16k_padded = np.concatenate([wav16k, zero_wav])[None, :]
@@ -127,8 +193,10 @@ class GPTSoVITS_ONNX_Inference:
         
         codes = self.run_sess(self.sess_vq, {"ssl_content": ssl_content})[0]
         prompt_semantic = codes[0, 0][None, :] # [1, T]
+        t_ref_end = time.perf_counter()
         
         print("Cleaning text and extracting BERT features...")
+        t_text_start = time.perf_counter()
         phones1, word2ph1, norm_text1 = clean_text(prompt_text, prompt_lang, self.version)
         phones1 = cleaned_text_to_sequence(phones1, self.version)
         
@@ -145,20 +213,26 @@ class GPTSoVITS_ONNX_Inference:
         
         all_phoneme_ids = np.array(phones1 + phones2, dtype=np.int64)[None, :]
         all_phoneme_len = np.array([all_phoneme_ids.shape[1]], dtype=np.int64)
+        t_text_end = time.perf_counter()
         
         print("Running GPT Encoder...")
+        t_gpt_enc_start = time.perf_counter()
         logits, k_cache, v_cache, x_len, y_len = self.run_sess(self.sess_gpt_enc, {
             "phoneme_ids": all_phoneme_ids,
             "phoneme_ids_len": all_phoneme_len,
             "prompts": prompt_semantic.astype(np.int64),
             "bert_feature": bert
         })
+        t_gpt_enc_end = time.perf_counter()
         
         current_samples = sample_logits(logits, top_k=top_k, temperature=temperature)
         decoded_semantic = [prompt_semantic, current_samples]
         
         print("Running GPT Step loop...")
+        t_gpt_dec_start = time.perf_counter()
         max_steps = 1500
+        reached_eos = False
+        steps = 0
         for i in range(max_steps):
             step_outputs = self.run_sess(self.sess_gpt_step, {
                 "samples": current_samples,
@@ -172,10 +246,12 @@ class GPTSoVITS_ONNX_Inference:
             
             current_samples = sample_logits(logits, top_k=top_k, temperature=temperature)
             decoded_semantic.append(current_samples)
-            
+            steps += 1
             if current_samples[0, 0] == 1024:
                 print(f"Reached EOS at step {i}")
+                reached_eos = True
                 break
+        t_gpt_dec_end = time.perf_counter()
         
         pred_semantic = np.concatenate(decoded_semantic, axis=1)
         generated_sem = pred_semantic[:, prompt_semantic.shape[1]:]
@@ -184,6 +260,7 @@ class GPTSoVITS_ONNX_Inference:
         generated_sem = generated_sem[:, None, :] # [1, 1, T]
         
         print("Running SoVITS Decoder...")
+        t_sovits_start = time.perf_counter()
         # Get refer spectrogram
         # Ensure hps is object-like if it's a dict
         class AttrDict(dict):
@@ -209,6 +286,15 @@ class GPTSoVITS_ONNX_Inference:
         wav16k_sv, _ = librosa.load(ref_wav_path, sr=16000)
         sv_emb = self.sv_model.compute_embedding3(torch.from_numpy(wav16k_sv)[None, :]).detach().cpu().numpy()
         
+        # Align sv_emb size for Pro models if needed
+        sv_emb_expected = 20480 if "Pro" in self.version else 512
+        if sv_emb.shape[-1] != sv_emb_expected:
+            padded_sv_emb = np.zeros((1, sv_emb_expected), dtype=np.float32)
+            # Copy available embedding data
+            min_dim = min(sv_emb.shape[-1], sv_emb_expected)
+            padded_sv_emb[:, :min_dim] = sv_emb[:, :min_dim]
+            sv_emb = padded_sv_emb
+
         sovits_inputs = {
             "pred_semantic": generated_sem.astype(np.int64),
             "text_seq": np.array(phones2, dtype=np.int64)[None, :],
@@ -217,6 +303,19 @@ class GPTSoVITS_ONNX_Inference:
         }
         
         audio = self.run_sess(self.sess_sovits, sovits_inputs)[0]
+        t_sovits_end = time.perf_counter()
+        
+        t_total_end = time.perf_counter()
+        
+        print(f"\n--- Inference Timings (Warmed Up) ---")
+        print(f"Ref Audio (SSL+VQ): {t_ref_end - t_ref_start:.4f}s")
+        print(f"Text (Cleaning+BERT): {t_text_end - t_text_start:.4f}s")
+        print(f"GPT Encoder: {t_gpt_enc_end - t_gpt_enc_start:.4f}s")
+        print(f"GPT Decoding: {t_gpt_dec_end - t_gpt_dec_start:.4f}s ({steps} steps, {(t_gpt_dec_end - t_gpt_dec_start)/max(1, steps):.5f}s/step)")
+        print(f"SoVITS Decoder: {t_sovits_end - t_sovits_start:.4f}s")
+        print(f"Total Time: {t_total_end - t_total_start:.4f}s")
+        print(f"-------------------------------------\n")
+
         
         sf.write(output_path, audio.squeeze(), self.hps["data"]["sampling_rate"])
         print(f"Saved to {output_path}")
