@@ -62,7 +62,11 @@ class Encoder(nn.Module):
             self.gin_channels = kwargs["gin_channels"]
 
     def forward(self, x, x_mask, g=None):
-        attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
+        # Create additive mask directly [b, 1, t, t]
+        attn_mask = (x_mask.unsqueeze(2) * x_mask.unsqueeze(-1))
+        # Convert 0/1 mask to 0/-1e4 bias for faster ONNX execution (avoid masked_fill)
+        attn_bias = (1.0 - attn_mask.to(dtype=x.dtype)) * -1e4
+        
         x = x * x_mask
         if g is not None:
             g = self.cond_layer(g)
@@ -72,8 +76,10 @@ class Encoder(nn.Module):
                 x = self.cond_pre(x)
                 cond_offset = i * 2 * self.hidden_channels
                 g_l = g[:, cond_offset : cond_offset + 2 * self.hidden_channels, :]
-                x = commons.fused_add_tanh_sigmoid_multiply(x, g_l, torch.IntTensor([self.hidden_channels]))
-            y = self.attn_layers[i](x, x, attn_mask)
+                # Use a scalar tensor but ensure it's not a python int
+                hidden_ch_tensor = torch.tensor([self.hidden_channels], device=x.device, dtype=torch.int32)
+                x = commons.fused_add_tanh_sigmoid_multiply(x, g_l, hidden_ch_tensor)
+            y = self.attn_layers[i](x, x, attn_bias)
             y = self.drop(y)
             x = self.norm_layers_1[i](x + y)
 
@@ -242,7 +248,8 @@ class MultiHeadAttention(nn.Module):
             assert t_s == t_t, "Proximal bias is only available for self-attention."
             scores = scores + self._attention_bias_proximal(t_s).to(device=scores.device, dtype=scores.dtype)
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e4)
+            # Mask is now expected to be a float bias (0 or -1e4)
+            scores = scores + mask
             if self.block_length is not None:
                 assert t_s == t_t, "Local attention is only available for self-attention."
                 block_mask = torch.ones_like(scores).triu(-self.block_length).tril(self.block_length)
@@ -399,8 +406,7 @@ class FFN(nn.Module):
             return x
         pad_l = self.kernel_size - 1
         pad_r = 0
-        padding = [[0, 0], [0, 0], [pad_l, pad_r]]
-        x = F.pad(x, commons.convert_pad_shape(padding))
+        x = F.pad(x, [pad_l, pad_r])
         return x
 
     def _same_padding(self, x):
@@ -408,8 +414,7 @@ class FFN(nn.Module):
             return x
         pad_l = (self.kernel_size - 1) // 2
         pad_r = self.kernel_size // 2
-        padding = [[0, 0], [0, 0], [pad_l, pad_r]]
-        x = F.pad(x, commons.convert_pad_shape(padding))
+        x = F.pad(x, [pad_l, pad_r])
         return x
 
 

@@ -238,14 +238,11 @@ class TextEncoder(nn.Module):
 
         if overlap_frames is not None:
             overlap_len = overlap_frames.shape[-1]
-            window = WINDOW.get(overlap_len, None)
-            if window is None:
-                # WINDOW[overlap_len] = torch.hann_window(overlap_len*2, device=y.device, dtype=y.dtype)
-                WINDOW[overlap_len] = torch.sin(torch.arange(overlap_len*2, device=y.device) * torch.pi / (overlap_len*2))
-                window = WINDOW[overlap_len]
+            # Avoid WINDOW dictionary and dynamic sin generation for ONNX
+            # Create window on the fly using tensor ops tied to current device/dtype
+            t = torch.arange(overlap_len * 2, device=y.device, dtype=y.dtype)
+            window = torch.sin(t * (math.pi / (overlap_len * 2)))
 
-
-            window = window.to(y.device)
             y[:,:,:overlap_len] = (
                 window[:overlap_len].view(1, 1, -1) * y[:,:,:overlap_len]
                 + window[overlap_len:].view(1, 1, -1) * overlap_frames
@@ -255,9 +252,10 @@ class TextEncoder(nn.Module):
         y_mask_ = y_mask
 
         if speed != 1:
-            # Use scale_factor for better ONNX export support
+            # Use scale_factor for better ONNX export support, avoid passing dynamic size
             y = F.interpolate(y, scale_factor=1.0/speed, mode="linear")
-            y_mask = F.interpolate(y_mask, size=y.shape[-1], mode="nearest")
+            # For mask, use nearest with scale_factor too
+            y_mask = F.interpolate(y_mask, scale_factor=1.0/speed, mode="nearest")
         stats = self.proj(y) * y_mask
         m, logs = torch.split(stats, self.out_channels, dim=1)
         return y, m, logs, y_mask, y_, y_mask_
@@ -996,8 +994,9 @@ class SynthesizerTrn(nn.Module):
         def get_ge(refer, sv_emb):
             ge = None
             if refer is not None:
-                refer_lengths = torch.LongTensor([refer.size(2)]).to(refer.device)
-                refer_mask = torch.unsqueeze(commons.sequence_mask(refer_lengths, refer.size(2)), 1).to(refer.dtype)
+                # Use tensor operations to get size for ONNX compatibility
+                refer_len = torch.tensor(refer.size(2), device=refer.device).unsqueeze(0)
+                refer_mask = torch.unsqueeze(commons.sequence_mask(refer_len, refer.size(2)), 1).to(refer.dtype)
                 if self.version == "v1":
                     ge = self.ref_enc(refer * refer_mask, refer_mask)
                 else:
@@ -1019,8 +1018,8 @@ class SynthesizerTrn(nn.Module):
 
         # Calculate lengths dynamically from input shapes for ONNX support
         # Using tensor operations instead of Python scalars to avoid constant-folding
-        y_lengths = torch.tensor(codes.shape[2], device=codes.device).unsqueeze(0) * 2
-        text_lengths = torch.tensor(text.shape[-1], device=text.device).unsqueeze(0)
+        y_lengths = (torch.tensor(codes.shape[2], device=codes.device) * 2).reshape(1)
+        text_lengths = torch.tensor(text.shape[-1], device=text.device).reshape(1)
 
         quantized = self.quantizer.decode(codes)
         if self.semantic_frame_rate == "25hz":
@@ -1070,8 +1069,8 @@ class SynthesizerTrn(nn.Module):
 
         # Calculate lengths dynamically from input shapes for ONNX support
         # Using tensor operations instead of Python scalars to avoid constant-folding
-        y_lengths = torch.tensor(codes.shape[2], device=codes.device).unsqueeze(0) * 2
-        text_lengths = torch.tensor(text.shape[-1], device=text.device).unsqueeze(0)
+        y_lengths = (torch.tensor(codes.shape[2], device=codes.device) * 2).reshape(1)
+        text_lengths = torch.tensor(text.shape[-1], device=text.device).reshape(1)
 
         quantized = self.quantizer.decode(codes)
         if self.semantic_frame_rate == "25hz":

@@ -57,6 +57,7 @@ class GPTSoVITS_ONNX_Inference:
         
         so = onnxruntime.SessionOptions()
         so.log_severity_level = 4
+        so = None
         sol = onnxruntime.SessionOptions()
         sol.log_severity_level = 1
         # sol = None
@@ -72,14 +73,14 @@ class GPTSoVITS_ONNX_Inference:
         self.sess_ssl = onnxruntime.InferenceSession(f"{onnx_dir}/ssl.onnx", sess_options=so, providers=self.providers)
         self.sess_bert = onnxruntime.InferenceSession(f"{onnx_dir}/bert.onnx", sess_options=so,
                                                       providers=self.providers)
-        self.sess_vq = onnxruntime.InferenceSession(f"{onnx_dir}/vq_encoder.onnx", sess_options=sol,
+        self.sess_vq = onnxruntime.InferenceSession(f"{onnx_dir}/vq_encoder.onnx", sess_options=so,
                                                     providers=self.providers)
         self.sess_gpt_enc = onnxruntime.InferenceSession(f"{onnx_dir}/gpt_encoder.onnx", sess_options=so,
                                                          providers=self.providers)
         self.sess_gpt_step = onnxruntime.InferenceSession(f"{onnx_dir}/gpt_step.onnx", sess_options=so,
                                                           providers=self.providers)
 
-        self.sess_sovits = onnxruntime.InferenceSession(f"{onnx_dir}/sovits.onnx", sess_options=so,
+        self.sess_sovits = onnxruntime.InferenceSession(f"{onnx_dir}/sovits.onnx", sess_options=sol,
                                                         providers=self.providers)
 
         self.step_inputs_info = {node.name: node.type for node in self.sess_gpt_step.get_inputs()}
@@ -376,7 +377,7 @@ class GPTSoVITS_ONNX_Inference:
         t_total = time.perf_counter() - t_total_start
 
         sf.write(output_path, audio.squeeze().astype(np.float32), hps.data.sampling_rate)
-
+        print(f"write {output_path}")
         # Report
         t_step_avg = t_gpt_dec / steps if steps > 0 else 0.0
         print("\n--- Inference Timings (Warmed Up) ---")
