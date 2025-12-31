@@ -22,6 +22,7 @@ cwd = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(cwd)
 sys.path.append(os.path.join(cwd, "GPT_SoVITS"))
 
+from GPT_SoVITS.text.LangSegmenter import LangSegmenter
 from GPT_SoVITS.text import cleaned_text_to_sequence
 from GPT_SoVITS.text.cleaner import clean_text
 from GPT_SoVITS.module.mel_processing import spectrogram_torch
@@ -56,13 +57,16 @@ class GPTSoVITS_ONNX_Inference:
         self.device = device
         
         so = onnxruntime.SessionOptions()
-        so.log_severity_level = 4
-        so = None
+        so.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+        # so.log_severity_level = 1
+        # so = None
         sol = onnxruntime.SessionOptions()
-        sol.log_severity_level = 1
+        # sol.log_severity_level = 1
         # sol = None
         # Prevent aggressive CPU fallback heuristics by limiting optimization level
-        # sol.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+        # so.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+        # sol.enable_profiling = True
+        # sol.profile_file_prefix = "gpt_profile"
 
         if device == "cuda":
             self.providers = [("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"]
@@ -80,7 +84,7 @@ class GPTSoVITS_ONNX_Inference:
         self.sess_gpt_step = onnxruntime.InferenceSession(f"{onnx_dir}/gpt_step.onnx", sess_options=so,
                                                           providers=self.providers)
 
-        self.sess_sovits = onnxruntime.InferenceSession(f"{onnx_dir}/sovits.onnx", sess_options=sol,
+        self.sess_sovits = onnxruntime.InferenceSession(f"{onnx_dir}/sovits.onnx", sess_options=so,
                                                         providers=self.providers)
 
         self.step_inputs_info = {node.name: node.type for node in self.sess_gpt_step.get_inputs()}
@@ -122,7 +126,7 @@ class GPTSoVITS_ONNX_Inference:
         for inp in step_inputs:
             print(f"  - Model Input '{inp.name}': {inp.type}")
 
-        # 1. Text Cleaner Warmup (加载字典)
+        # Text Cleaner Warmup (加载字典)
         # 针对中英双语分别调用一次，触发 Lazy Loading
         try:
             # 简单词汇即可，覆盖 zh 和 en 逻辑分支
@@ -131,7 +135,7 @@ class GPTSoVITS_ONNX_Inference:
         except Exception as e:
             print(f"Text Cleaner Warmup Warning: {e}")
 
-        # 2. ONNX Models Warmup
+        # ONNX Models Warmup
         try:
             # SSL & VQ
             dummy_audio = np.zeros((1, 48000), dtype=self.precision)
@@ -164,19 +168,26 @@ class GPTSoVITS_ONNX_Inference:
             if self.step_inputs_info.get("k_cache", "").find("float16") != -1:
                 cache_dtype = np.float16
 
-            # 触发一次即可分配显存
-            # 构造最小 Dummy 输入以通过 Shape 检查
-            # 假设 standard layer/head 配置，如有特定维度需求可调整
-            dummy_cache = np.zeros((32, 2, 1, 16, 0, 64), dtype=cache_dtype)
+            # SV Model Warmup (PyTorch)
+            print("  - Warming up SV model...")
+            dummy_wav_sv = torch.zeros((1, 16000), device=self.device)
+            self.sv_model.compute_embedding3(dummy_wav_sv)
 
-            # SoVITS
-            dummy_sem = np.zeros((1, 256), dtype=np.int64)
-            dummy_seq = np.zeros((1, 256), dtype=np.int64)
+            # SoVITS Warmup
+            print("  - Warming up SoVITS...")
+            dummy_sem = np.zeros((1, 1, 128), dtype=np.int64)
+            dummy_seq = np.zeros((1, 64), dtype=np.int64)
             dummy_spec = np.zeros((1, 1025, 100), dtype=self.precision)
-            dummy_emb = np.zeros((1, 256), dtype=self.precision)
+            
+            sv_size = 20480 if "Pro" in self.version else 512
+            dummy_emb = np.zeros((1, sv_size), dtype=self.precision)
 
-            # 运行 SoVITS 空跑 (如果有维度报错可忽略，重点是加载库)
-            pass
+            self.run_sess(self.sess_sovits, {
+                "pred_semantic": dummy_sem,
+                "text_seq": dummy_seq,
+                "refer_spec": dummy_spec,
+                "sv_emb": dummy_emb,
+            })
 
         except Exception as e:
             print(f"ONNX Warmup partial warning: {e}")
@@ -219,6 +230,86 @@ class GPTSoVITS_ONNX_Inference:
         phone_level_feature = np.concatenate(phone_level_feature, axis=0)
         return phone_level_feature.T
 
+    def get_bert_inf(self, phones, word2ph, norm_text, language):
+        language = language.replace("all_", "")
+        if language == "zh":
+            bert = self.get_bert_feature(norm_text, word2ph, language)
+        else:
+            bert = np.zeros(
+                (1024, len(phones)),
+                dtype=self.precision
+            )
+        return bert
+
+    def get_phones_and_bert(self, text, language, version):
+        import re
+        text = re.sub(r' {2,}', ' ', text)
+        textlist = []
+        langlist = []
+        if language == "all_zh":
+            for tmp in LangSegmenter.getTexts(text, "zh"):
+                langlist.append(tmp["lang"])
+                textlist.append(tmp["text"])
+        elif language == "all_yue":
+            for tmp in LangSegmenter.getTexts(text, "zh"):
+                if tmp["lang"] == "zh":
+                    tmp["lang"] = "yue"
+                langlist.append(tmp["lang"])
+                textlist.append(tmp["text"])
+        elif language == "all_ja":
+            for tmp in LangSegmenter.getTexts(text, "ja"):
+                langlist.append(tmp["lang"])
+                textlist.append(tmp["text"])
+        elif language == "all_ko":
+            for tmp in LangSegmenter.getTexts(text, "ko"):
+                langlist.append(tmp["lang"])
+                textlist.append(tmp["text"])
+        elif language == "en":
+            langlist.append("en")
+            textlist.append(text)
+        elif language == "auto":
+            for tmp in LangSegmenter.getTexts(text):
+                langlist.append(tmp["lang"])
+                textlist.append(tmp["text"])
+        elif language == "auto_yue":
+            for tmp in LangSegmenter.getTexts(text):
+                if tmp["lang"] == "zh":
+                    tmp["lang"] = "yue"
+                langlist.append(tmp["lang"])
+                textlist.append(tmp["text"])
+        else:
+            for tmp in LangSegmenter.getTexts(text):
+                if langlist:
+                    if (tmp["lang"] == "en" and langlist[-1] == "en") or (tmp["lang"] != "en" and langlist[-1] != "en"):
+                        textlist[-1] += tmp["text"]
+                        continue
+                if tmp["lang"] == "en":
+                    langlist.append(tmp["lang"])
+                else:
+                    langlist.append(language.replace("all_", ""))
+                textlist.append(tmp["text"])
+
+        print(f"Text segments: {textlist}")
+        print(f"Language segments: {langlist}")
+
+        phones_list = []
+        bert_list = []
+        norm_text_list = []
+        for i in range(len(textlist)):
+            lang = langlist[i]
+            phones, word2ph, norm_text = clean_text(textlist[i], lang, version)
+            phones = cleaned_text_to_sequence(phones, version)
+            bert = self.get_bert_inf(phones, word2ph, norm_text, lang)
+            phones_list.append(phones)
+            norm_text_list.append(norm_text)
+            bert_list.append(bert)
+
+        bert = np.concatenate(bert_list, axis=1)
+        phones = sum(phones_list, [])
+        norm_text = "".join(norm_text_list)
+
+        return phones, bert.astype(self.precision), norm_text
+
     def _to_gpu_ort(self, data):
         if self.device != "cuda": return onnxruntime.OrtValue.ortvalue_from_numpy(data)
         return onnxruntime.OrtValue.ortvalue_from_numpy(data, "cuda", 0)
@@ -252,15 +343,9 @@ class GPTSoVITS_ONNX_Inference:
 
         # 2. Text
         t_start = time.perf_counter()
-        phones1, word2ph1, norm_text1 = clean_text(prompt_text, prompt_lang, self.version)
-        phones1 = cleaned_text_to_sequence(phones1, self.version)
-        phones2, word2ph2, norm_text2 = clean_text(text, text_lang, self.version)
-        phones2 = cleaned_text_to_sequence(phones2, self.version)
+        phones1, bert1, norm_text1 = self.get_phones_and_bert(prompt_text, prompt_lang, self.version)
+        phones2, bert2, norm_text2 = self.get_phones_and_bert(text, text_lang, self.version)
 
-        bert1 = self.get_bert_feature(norm_text1, word2ph1, prompt_lang)
-        bert2 = self.get_bert_feature(norm_text2, word2ph2, text_lang)
-        if bert1 is None: bert1 = np.zeros((1024, len(phones1)), dtype=self.precision)
-        if bert2 is None: bert2 = np.zeros((1024, len(phones2)), dtype=self.precision)
         bert = np.concatenate([bert1, bert2], axis=1)[None, :, :].astype(self.precision)
 
         all_phoneme_ids = np.array(phones1 + phones2, dtype=np.int64)[None, :]

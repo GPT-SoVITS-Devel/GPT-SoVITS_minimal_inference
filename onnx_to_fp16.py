@@ -19,8 +19,15 @@ MODEL_CONFIGS = {
 
 # 全局通用黑名单
 GLOBAL_SENSITIVE_OPS = [
-    "Softmax", "LayerNormalization", "InstanceNormalization",
-    "ReduceMean", "Pow", "Exp", "Resize", "Mean", "Sum"
+    "Softmax",
+    "LayerNormalization",
+    "InstanceNormalization",
+    "ReduceMean",
+    "Pow",
+    "Exp",
+    "Resize",
+    "Mean",
+    "Sum",
 ]
 
 
@@ -33,7 +40,6 @@ def get_tensor_type(name, type_map, initializer_map, graph_input_map):
 
 def fix_mixed_types_robust(model):
     """
-    [保留你的强力修复逻辑]
     用于修复 GPT/SoVITS 转换 FP16 后遗留的类型不匹配问题
     """
     initializer_map = {init.name: init.data_type for init in model.graph.initializer}
@@ -84,13 +90,12 @@ def fix_mixed_types_robust(model):
 
 
 def fix_broken_attributes(model):
-
     try:
         model = onnx.shape_inference.infer_shapes(model)
     except:
         print("    [Warn] Shape inference failed inside fix_broken_attributes, relying on partial info.")
 
-    # 2. 构建类型映射 (Name -> DataType)
+    # 构建类型映射 (Name -> DataType)
     type_map = {}
     for vi in list(model.graph.input) + list(model.graph.output) + list(model.graph.value_info):
         if vi.type.HasField("tensor_type"):
@@ -143,7 +148,7 @@ def optimize_single_model(input_path, output_path):
     filename = os.path.basename(input_path)
     model_name_key = None
 
-    # 1. 匹配策略
+    # 匹配策略
     for key in MODEL_CONFIGS:
         if key in filename:
             model_name_key = key
@@ -156,7 +161,7 @@ def optimize_single_model(input_path, output_path):
 
     model = onnx.load(input_path)
 
-    # 2. 如果启用 FP16，执行转换和修复
+    # 如果启用 FP16，执行转换和修复
     if config["fp16"]:
         print("  Converting to FP16...")
         block_list = GLOBAL_SENSITIVE_OPS + config["sensitive"]
@@ -171,7 +176,7 @@ def optimize_single_model(input_path, output_path):
     else:
         print("  Skipping FP16 conversion (Sensitivity/Low-Cost).")
 
-    # 3. 通用 Simplification (无论 FP16 还是 FP32 都需要简化)
+    # 通用 Simplification (无论 FP16 还是 FP32 都需要简化)
     print("  Simplifying...")
     try:
         model, check = simplify(model)

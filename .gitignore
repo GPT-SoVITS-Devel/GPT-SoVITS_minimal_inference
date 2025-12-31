@@ -6,3 +6,4 @@
 *.wav
 /onnx
 /pretrained_models
+/onnx_export/

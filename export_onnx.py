@@ -95,7 +95,7 @@ def export_onnx(args):
     device = "cpu" # Export on CPU usually safer for dynamic axes
     
     print("Loading models...")
-    # 1. SSL
+    # SSL
     cnhubert.cnhubert_base_path = args.cnhubert_base_path
     ssl_model = cnhubert.get_model()
     ssl_model = ssl_model.to(device)
@@ -107,14 +107,14 @@ def export_onnx(args):
     bert_model = bert_model.to(device)
     bert_model.eval()
 
-    # 2. GPT
+    # GPT
     dict_s1 = torch.load(args.gpt_path, map_location="cpu")
     config = dict_s1["config"]
     t2s_model = Text2SemanticLightningModule(config, "output", is_train=False)
     t2s_model.load_state_dict(dict_s1["weight"])
     t2s_model.eval()
     
-    # 3. SoVITS
+    # SoVITS
     dict_s2 = load_sovits_new(args.sovits_path)
     hps = dict_s2["config"]
     # Handle DictToAttrRecursive logic manually or using the class if available. 
