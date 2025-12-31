@@ -4,6 +4,8 @@ import numpy as np
 import argparse
 import os
 
+os.environ["NO_COLOR"] = "1"
+os.environ["TERM"] = "dumb"
 import librosa
 import soundfile as sf
 import sys
@@ -24,10 +26,6 @@ from GPT_SoVITS.text import cleaned_text_to_sequence
 from GPT_SoVITS.text.cleaner import clean_text
 from GPT_SoVITS.module.mel_processing import spectrogram_torch
 from GPT_SoVITS.sv import SV
-
-# Global Options
-so = onnxruntime.SessionOptions()
-so.log_severity_level = 1
 
 
 def sample_logits(logits, top_k=5, top_p=1.0, temperature=1.0):
@@ -56,21 +54,33 @@ class GPTSoVITS_ONNX_Inference:
     def __init__(self, onnx_dir, bert_path, sovits_path, device="cpu"):
         self.onnx_dir = onnx_dir
         self.device = device
+        
+        so = onnxruntime.SessionOptions()
+        so.log_severity_level = 4
+        sol = onnxruntime.SessionOptions()
+        sol.log_severity_level = 1
+        # sol = None
+        # Prevent aggressive CPU fallback heuristics by limiting optimization level
+        # sol.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+
         if device == "cuda":
-            # self.providers = [("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"]
-            self.providers = [("CUDAExecutionProvider", {"device_id": 0})]
+            self.providers = [("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"]
         else:
-            # self.providers = ["CPUExecutionProvider"]
-            pass
-
+            self.providers = ["CPUExecutionProvider"]
+        
         print(f"Loading ONNX models from {onnx_dir} on {device}...")
+        self.sess_ssl = onnxruntime.InferenceSession(f"{onnx_dir}/ssl.onnx", sess_options=so, providers=self.providers)
+        self.sess_bert = onnxruntime.InferenceSession(f"{onnx_dir}/bert.onnx", sess_options=so,
+                                                      providers=self.providers)
+        self.sess_vq = onnxruntime.InferenceSession(f"{onnx_dir}/vq_encoder.onnx", sess_options=sol,
+                                                    providers=self.providers)
+        self.sess_gpt_enc = onnxruntime.InferenceSession(f"{onnx_dir}/gpt_encoder.onnx", sess_options=so,
+                                                         providers=self.providers)
+        self.sess_gpt_step = onnxruntime.InferenceSession(f"{onnx_dir}/gpt_step.onnx", sess_options=so,
+                                                          providers=self.providers)
 
-        self.sess_ssl = onnxruntime.InferenceSession(f"{onnx_dir}/ssl.onnx", providers=self.providers)
-        self.sess_bert = onnxruntime.InferenceSession(f"{onnx_dir}/bert.onnx", providers=self.providers)
-        self.sess_vq = onnxruntime.InferenceSession(f"{onnx_dir}/vq_encoder.onnx", providers=self.providers)
-        self.sess_gpt_enc = onnxruntime.InferenceSession(f"{onnx_dir}/gpt_encoder.onnx", providers=self.providers)
-        self.sess_gpt_step = onnxruntime.InferenceSession(f"{onnx_dir}/gpt_step.onnx", providers=self.providers)
-        self.sess_sovits = onnxruntime.InferenceSession(f"{onnx_dir}/sovits.onnx", providers=self.providers)
+        self.sess_sovits = onnxruntime.InferenceSession(f"{onnx_dir}/sovits.onnx", sess_options=so,
+                                                        providers=self.providers)
 
         self.step_inputs_info = {node.name: node.type for node in self.sess_gpt_step.get_inputs()}
         self.tokenizer = AutoTokenizer.from_pretrained(bert_path)
@@ -85,6 +95,18 @@ class GPTSoVITS_ONNX_Inference:
         self.hps["model"]["semantic_frame_rate"] = "25hz"
 
         self.sv_model = SV(device, False)
+
+        # Detect Model Precision from GPT Encoder inputs
+        self.precision = np.float32
+        try:
+            for node in self.sess_gpt_enc.get_inputs():
+                if node.name == "bert_feature" and node.type == 'tensor(float16)':
+                    self.precision = np.float16
+                    print("Detected FP16 model inputs. Enabling FP16 inference mode.")
+                    break
+        except:
+            pass
+
         self.warmup()
 
     def warmup(self):
@@ -93,6 +115,11 @@ class GPTSoVITS_ONNX_Inference:
         包含 Text Cleaner (Jieba/CMU Dict加载) 和 ONNX Session 初始化
         """
         print("Warming up all components (Text Cleaner + ONNX)...")
+
+        # Check input precision for GPT Step (as a representative)
+        step_inputs = self.sess_gpt_step.get_inputs()
+        for inp in step_inputs:
+            print(f"  - Model Input '{inp.name}': {inp.type}")
 
         # 1. Text Cleaner Warmup (加载字典)
         # 针对中英双语分别调用一次，触发 Lazy Loading
@@ -106,9 +133,9 @@ class GPTSoVITS_ONNX_Inference:
         # 2. ONNX Models Warmup
         try:
             # SSL & VQ
-            dummy_audio = np.zeros((1, 48000), dtype=np.float32)
+            dummy_audio = np.zeros((1, 48000), dtype=self.precision)
             self.run_sess(self.sess_ssl, {"audio": dummy_audio})
-            dummy_ssl = np.zeros((1, 768, 150), dtype=np.float32)
+            dummy_ssl = np.zeros((1, 768, 150), dtype=self.precision)
             self.run_sess(self.sess_vq, {"ssl_content": dummy_ssl})
 
             # BERT
@@ -121,7 +148,7 @@ class GPTSoVITS_ONNX_Inference:
 
             # GPT Encoder
             dummy_phones = np.zeros((1, 256), dtype=np.int64)
-            dummy_bert = np.zeros((1, 1024, 256), dtype=np.float32)
+            dummy_bert = np.zeros((1, 1024, 256), dtype=self.precision)
             dummy_prompt = np.zeros((1, 50), dtype=np.int64)
             dummy_len = np.array([256], dtype=np.int64)
             self.run_sess(self.sess_gpt_enc, {
@@ -144,8 +171,8 @@ class GPTSoVITS_ONNX_Inference:
             # SoVITS
             dummy_sem = np.zeros((1, 256), dtype=np.int64)
             dummy_seq = np.zeros((1, 256), dtype=np.int64)
-            dummy_spec = np.zeros((1, 1025, 100), dtype=np.float32)
-            dummy_emb = np.zeros((1, 256), dtype=np.float32)
+            dummy_spec = np.zeros((1, 1025, 100), dtype=self.precision)
+            dummy_emb = np.zeros((1, 256), dtype=self.precision)
 
             # 运行 SoVITS 空跑 (如果有维度报错可忽略，重点是加载库)
             pass
@@ -170,13 +197,7 @@ class GPTSoVITS_ONNX_Inference:
                         val = val.astype(np.int64)
                 actual_inputs[i.name] = val
         outputs = sess.run(None, actual_inputs)
-        processed_outputs = []
-        for out in outputs:
-            if isinstance(out, np.ndarray) and out.dtype == np.float16:
-                processed_outputs.append(out.astype(np.float32))
-            else:
-                processed_outputs.append(out)
-        return processed_outputs
+        return outputs
 
     def get_bert_feature(self, text, word2ph, language):
         if language != "zh": return None
@@ -217,7 +238,8 @@ class GPTSoVITS_ONNX_Inference:
         # 1. Audio
         t_start = time.perf_counter()
         wav16k, _ = librosa.load(ref_wav_path, sr=16000)
-        zero_wav = np.zeros(int(16000 * 0.3), dtype=np.float32)
+        wav16k = wav16k.astype(self.precision)
+        zero_wav = np.zeros(int(16000 * 0.3), dtype=self.precision)
         wav16k_padded = np.concatenate([wav16k, zero_wav])[None, :]
 
         ssl_content = self.run_sess(self.sess_ssl, {"audio": wav16k_padded})[0]
@@ -236,9 +258,9 @@ class GPTSoVITS_ONNX_Inference:
 
         bert1 = self.get_bert_feature(norm_text1, word2ph1, prompt_lang)
         bert2 = self.get_bert_feature(norm_text2, word2ph2, text_lang)
-        if bert1 is None: bert1 = np.zeros((1024, len(phones1)), dtype=np.float32)
-        if bert2 is None: bert2 = np.zeros((1024, len(phones2)), dtype=np.float32)
-        bert = np.concatenate([bert1, bert2], axis=1)[None, :, :].astype(np.float32)
+        if bert1 is None: bert1 = np.zeros((1024, len(phones1)), dtype=self.precision)
+        if bert2 is None: bert2 = np.zeros((1024, len(phones2)), dtype=self.precision)
+        bert = np.concatenate([bert1, bert2], axis=1)[None, :, :].astype(self.precision)
 
         all_phoneme_ids = np.array(phones1 + phones2, dtype=np.int64)[None, :]
         all_phoneme_len = np.array([all_phoneme_ids.shape[1]], dtype=np.int64)
@@ -282,10 +304,14 @@ class GPTSoVITS_ONNX_Inference:
         for i in range(max_steps):
             io_binding = self.sess_gpt_step.io_binding()
 
-            io_binding.bind_cpu_input("samples", current_samples)
+            samples_ort = self._to_gpu_ort(current_samples)
+            io_binding.bind_ortvalue_input("samples", samples_ort)
             io_binding.bind_ortvalue_input("k_cache", k_cache_ort)
             io_binding.bind_ortvalue_input("v_cache", v_cache_ort)
-            io_binding.bind_cpu_input("idx", np.array([i], dtype=np.int64))
+
+            idx_ort = self._to_gpu_ort(np.array([i], dtype=np.int64))
+            io_binding.bind_ortvalue_input("idx", idx_ort)
+
             if x_len_ort: io_binding.bind_ortvalue_input("x_len", x_len_ort)
             if y_len_ort: io_binding.bind_ortvalue_input("y_len", y_len_ort)
 
@@ -342,14 +368,14 @@ class GPTSoVITS_ONNX_Inference:
         audio = self.run_sess(self.sess_sovits, {
             "pred_semantic": generated_sem.astype(np.int64),
             "text_seq": np.array(phones2, dtype=np.int64)[None, :],
-            "refer_spec": spec.astype(np.float32),
-            "sv_emb": sv_emb.astype(np.float32),
+            "refer_spec": spec.astype(self.precision),
+            "sv_emb": sv_emb.astype(self.precision),
         })[0]
 
         t_sovits = time.perf_counter() - t_start
         t_total = time.perf_counter() - t_total_start
 
-        sf.write(output_path, audio.squeeze(), hps.data.sampling_rate)
+        sf.write(output_path, audio.squeeze().astype(np.float32), hps.data.sampling_rate)
 
         # Report
         t_step_avg = t_gpt_dec / steps if steps > 0 else 0.0

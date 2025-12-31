@@ -162,7 +162,7 @@ def optimize_single_model(input_path, output_path):
         block_list = GLOBAL_SENSITIVE_OPS + config["sensitive"]
         model = convert_float_to_float16(
             model,
-            keep_io_types=True,
+            keep_io_types=False,
             op_block_list=block_list
         )
         # 仅在 FP16 模式下需要修复混合精度

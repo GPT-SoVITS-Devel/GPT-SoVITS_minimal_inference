@@ -114,6 +114,7 @@ class T2SBlock:
         self.norm_b2 = norm_b2
         self.norm_eps2 = norm_eps2
 
+        self.head_dim = self.hidden_dim // self.num_heads
         self.false = torch.tensor(False, dtype=torch.bool)
 
     @torch.jit.ignore
@@ -137,26 +138,30 @@ class T2SBlock:
         padding_mask: Optional[torch.Tensor] = None,
         torch_sdpa: bool = True,
     ):
-        q, k, v = F.linear(self.to_mask(x, padding_mask), self.qkv_w, self.qkv_b).chunk(3, dim=-1)
+        x_masked = self.to_mask(x, padding_mask)
+        qkv = F.linear(x_masked, self.qkv_w, self.qkv_b)
+        q = qkv[:, :, :self.hidden_dim]
+        k = qkv[:, :, self.hidden_dim:self.hidden_dim*2]
+        v = qkv[:, :, self.hidden_dim*2:]
 
         batch_size = q.shape[0]
-        q_len = q.shape[1]
-        kv_len = k.shape[1]
+        # q_len = q.shape[1]
+        # kv_len = k.shape[1]
 
         q = self.to_mask(q, padding_mask)
         k_cache = self.to_mask(k, padding_mask)
         v_cache = self.to_mask(v, padding_mask)
 
-        q = q.view(batch_size, q_len, self.num_heads, -1).transpose(1, 2)
-        k = k_cache.view(batch_size, kv_len, self.num_heads, -1).transpose(1, 2)
-        v = v_cache.view(batch_size, kv_len, self.num_heads, -1).transpose(1, 2)
+        q = q.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k_cache.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v_cache.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
         if torch_sdpa:
             attn = F.scaled_dot_product_attention(q, k, v, ~attn_mask)
         else:
             attn = scaled_dot_product_attention(q, k, v, attn_mask)
 
-        attn = attn.transpose(1, 2).reshape(batch_size, q_len, -1)
+        attn = attn.transpose(1, 2).reshape(batch_size, -1, self.hidden_dim)
         attn = F.linear(self.to_mask(attn, padding_mask), self.out_w, self.out_b)
 
         x = x + attn
@@ -179,25 +184,28 @@ class T2SBlock:
         attn_mask: torch.Tensor = None,
         torch_sdpa: bool = True,
     ):
-        q, k, v = F.linear(x, self.qkv_w, self.qkv_b).chunk(3, dim=-1)
+        qkv = F.linear(x, self.qkv_w, self.qkv_b)
+        q = qkv[:, :, :self.hidden_dim]
+        k = qkv[:, :, self.hidden_dim:self.hidden_dim*2]
+        v = qkv[:, :, self.hidden_dim*2:]
 
         k_cache = torch.cat([k_cache, k], dim=1)
         v_cache = torch.cat([v_cache, v], dim=1)
 
         batch_size = q.shape[0]
-        q_len = q.shape[1]
-        kv_len = k_cache.shape[1]
+        # q_len = q.shape[1]
+        # kv_len = k_cache.shape[1]
 
-        q = q.view(batch_size, q_len, self.num_heads, -1).transpose(1, 2)
-        k = k_cache.view(batch_size, kv_len, self.num_heads, -1).transpose(1, 2)
-        v = v_cache.view(batch_size, kv_len, self.num_heads, -1).transpose(1, 2)
+        q = q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k_cache.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v_cache.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
         if torch_sdpa:
             attn = F.scaled_dot_product_attention(q, k, v, (~attn_mask) if attn_mask is not None else None)
         else:
             attn = scaled_dot_product_attention(q, k, v, attn_mask)
 
-        attn = attn.transpose(1, 2).reshape(batch_size, q_len, -1)
+        attn = attn.transpose(1, 2).reshape(batch_size, 1, self.hidden_dim)
         attn = F.linear(attn, self.out_w, self.out_b)
 
         x = x + attn
@@ -1031,9 +1039,10 @@ class Text2SemanticDecoder(nn.Module):
         # Calculate position encoding
         # In loop: xy_pos = y_emb * scale + alpha * pe[:, y_len + idx]
         pos = y_len + idx
-        if isinstance(pos, torch.Tensor):
-            pos = pos.view(-1)
-        xy_pos = y_emb * self.ar_audio_position.x_scale + self.ar_audio_position.alpha * self.ar_audio_position.pe.index_select(1, pos).to(dtype=y_emb.dtype, device=y_emb.device)
+        # Ensure pos is 1-D for index_select which is robust for ONNX
+        index = pos.reshape(-1)
+        pe_slice = self.ar_audio_position.pe.index_select(1, index)
+        xy_pos = y_emb * self.ar_audio_position.x_scale + self.ar_audio_position.alpha * pe_slice.to(dtype=y_emb.dtype, device=y_emb.device)
 
         xy_dec, k_cache, v_cache = self.t2s_transformer.decode_next_token(xy_pos, k_cache, v_cache)
         logits = self.ar_predict_layer(xy_dec[:, -1])
