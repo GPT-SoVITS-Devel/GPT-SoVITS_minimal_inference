@@ -95,14 +95,56 @@ class GPTSoVITS_ONNX_Inference:
         self.warmup()
 
     def warmup(self):
-        """预热模型，消除首次推理的 JIT 编译延迟"""
-        print("Warming up...")
+        """预热模型，消除首次推理的延迟，以 256 长度为标准"""
+        print("Warming up ONNX models...")
+        
+        # 1. SSL + VQ Warmup
         audio = np.zeros((1, 32000), dtype=np.float32)
-        # 仅预热 SSL 即可触发大部分库加载
-        try:
-            _ = self.run_sess(self.sess_ssl, {"audio": audio})
-        except Exception as e:
-            print(f"Warmup warning: {e}")
+        ssl_content = self.run_sess(self.sess_ssl, {"audio": audio})[0]
+        ssl_content = ssl_content.transpose(0, 2, 1)
+        _ = self.run_sess(self.sess_vq, {"ssl_content": ssl_content})[0]
+
+        # 2. BERT Warmup (256 length)
+        dummy_input_ids = np.zeros((1, 256), dtype=np.int64)
+        _ = self.sess_bert.run(None, {
+            "input_ids": dummy_input_ids,
+            "attention_mask": dummy_input_ids,
+            "token_type_ids": dummy_input_ids
+        })
+
+        # 3. GPT Encoder Warmup (256 length)
+        phoneme_ids = np.zeros((1, 256), dtype=np.int64)
+        phoneme_ids_len = np.array([256], dtype=np.int64)
+        prompts = np.zeros((1, 256), dtype=np.int64)
+        bert_feature = np.zeros((1, 1024, 256), dtype=np.float32)
+        
+        logits, k_cache, v_cache, x_len, y_len = self.run_sess(self.sess_gpt_enc, {
+            "phoneme_ids": phoneme_ids,
+            "phoneme_ids_len": phoneme_ids_len,
+            "prompts": prompts,
+            "bert_feature": bert_feature
+        })
+
+        # 4. GPT Step Warmup
+        current_samples = np.zeros((1, 1), dtype=np.int64)
+        inputs = {
+            "samples": current_samples,
+            "k_cache": k_cache,
+            "v_cache": v_cache,
+            "idx": np.array([0], dtype=np.int64)
+        }
+        if "x_len" in self.step_inputs_info: inputs["x_len"] = x_len
+        if "y_len" in self.step_inputs_info: inputs["y_len"] = y_len
+        _ = self.run_sess(self.sess_gpt_step, inputs)
+
+        # 5. SoVITS Warmup (256 length)
+        sv_size = 20480 if "Pro" in self.version else 512
+        _ = self.run_sess(self.sess_sovits, {
+            "pred_semantic": np.zeros((1, 1, 256), dtype=np.int64),
+            "text_seq": np.zeros((1, 256), dtype=np.int64),
+            "refer_spec": np.zeros((1, 1025, 100), dtype=np.float32),
+            "sv_emb": np.zeros((1, sv_size), dtype=np.float32),
+        })
         print("Warmup complete.")
 
     def run_sess(self, sess, inputs):
@@ -167,7 +209,9 @@ class GPTSoVITS_ONNX_Inference:
 
         t_total_start = time.perf_counter()
 
-        # 1. Audio Processing
+        # 1. Audio Processing (SSL+VQ)
+        print("Processing reference audio...")
+        t_ref_start = time.perf_counter()
         wav16k, _ = librosa.load(ref_wav_path, sr=16000)
         zero_wav = np.zeros(int(16000 * 0.3), dtype=np.float32)
         wav16k_padded = np.concatenate([wav16k, zero_wav])[None, :]
@@ -177,8 +221,11 @@ class GPTSoVITS_ONNX_Inference:
 
         codes = self.run_sess(self.sess_vq, {"ssl_content": ssl_content})[0]
         prompt_semantic = codes[0, 0][None, :]
+        t_ref_end = time.perf_counter()
 
-        # 2. Text Processing
+        # 2. Text Processing (Cleaning+BERT)
+        print("Cleaning text and extracting BERT features...")
+        t_text_start = time.perf_counter()
         phones1, word2ph1, norm_text1 = clean_text(prompt_text, prompt_lang, self.version)
         phones1 = cleaned_text_to_sequence(phones1, self.version)
         phones2, word2ph2, norm_text2 = clean_text(text, text_lang, self.version)
@@ -192,25 +239,24 @@ class GPTSoVITS_ONNX_Inference:
 
         all_phoneme_ids = np.array(phones1 + phones2, dtype=np.int64)[None, :]
         all_phoneme_len = np.array([all_phoneme_ids.shape[1]], dtype=np.int64)
+        t_text_end = time.perf_counter()
 
         # 3. GPT Encoder
         print("Running GPT Encoder...")
-        # gpt_encoder 通常只有一次，FP16 模式下 sess.run 足够快
+        t_gpt_enc_start = time.perf_counter()
         logits, k_cache, v_cache, x_len, y_len = self.run_sess(self.sess_gpt_enc, {
             "phoneme_ids": all_phoneme_ids,
             "phoneme_ids_len": all_phoneme_len,
             "prompts": prompt_semantic.astype(np.int64),
             "bert_feature": bert
         })
+        t_gpt_enc_end = time.perf_counter()
 
         current_samples = sample_logits(logits, top_k=top_k, temperature=temperature)
         decoded_semantic_list = [prompt_semantic, current_samples]
 
-        # 4. GPT Step (Autoregressive Loop)
-        # [决策] 使用 Standard sess.run 循环
-        # 原因：IOBinding 在纯 FP16 循环下极易因累积误差导致 NaN，而 sess.run 的 CPU 往返隐式清洗了数据，保证了稳定性。
-        # 且对于小 Batch (1) 和小 Cache，PCIe 带宽不是瓶颈。
-        print(f"Running GPT Step (Standard Mode)...")
+        # 4. GPT Step Loop
+        print(f"Running GPT Step loop...")
         t_dec_start = time.perf_counter()
 
         steps = 0
@@ -227,13 +273,13 @@ class GPTSoVITS_ONNX_Inference:
             if "x_len" in self.step_inputs_info: inputs["x_len"] = x_len
             if "y_len" in self.step_inputs_info: inputs["y_len"] = y_len
 
-            # Run (这里会自动处理 FP16<->FP32 转换)
             logits, k_cache, v_cache = self.run_sess(self.sess_gpt_step, inputs)
 
             current_samples = sample_logits(logits, top_k=top_k, temperature=temperature)
             decoded_semantic_list.append(current_samples)
             steps += 1
             if current_samples[0, 0] == 1024:
+                print(f"Reached EOS at step {steps}")
                 break
 
         t_dec_end = time.perf_counter()
@@ -245,6 +291,7 @@ class GPTSoVITS_ONNX_Inference:
 
         # 5. SoVITS Decode
         print("Running SoVITS Decoder...")
+        t_sovits_start = time.perf_counter()
 
         class AttrDict(dict):
             def __init__(self, *args, **kwargs):
@@ -275,9 +322,21 @@ class GPTSoVITS_ONNX_Inference:
             "sv_emb": sv_emb.astype(np.float32),
         })[0]
 
+        t_sovits_end = time.perf_counter()
+        t_total_end = time.perf_counter()
+
         sf.write(output_path, audio.squeeze(), hps.data.sampling_rate)
-        print(
-            f"Done. GPT Steps: {steps}, Time: {t_dec_end - t_dec_start:.3f}s, Total: {time.perf_counter() - t_total_start:.3f}s")
+
+        # Print detailed timings
+        dec_time = t_dec_end - t_dec_start
+        print("\n--- Inference Timings (Warmed Up) ---")
+        print(f"Ref Audio (SSL+VQ): {t_ref_end - t_ref_start:.4f}s")
+        print(f"Text (Cleaning+BERT): {t_text_end - t_text_start:.4f}s")
+        print(f"GPT Encoder: {t_gpt_enc_end - t_gpt_enc_start:.4f}s")
+        print(f"GPT Decoding: {dec_time:.4f}s ({steps} steps, {dec_time / max(1, steps):.5f}s/step)")
+        print(f"SoVITS Decoder: {t_sovits_end - t_sovits_start:.4f}s")
+        print(f"Total Time: {t_total_end - t_total_start:.4f}s")
+        print("-------------------------------------\n")
 
 
 if __name__ == "__main__":
