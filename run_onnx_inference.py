@@ -3,11 +3,17 @@ import torch
 import numpy as np
 import argparse
 import os
+
 import librosa
 import soundfile as sf
 import sys
 import time
 from transformers import AutoTokenizer
+
+# os.environ["http_proxy"]='http://127.0.0.1:10809'
+# os.environ["https_proxy"]='http://127.0.0.1:10809'
+# import nltk
+# nltk.download('averaged_perceptron_tagger_eng')
 
 # Setup paths
 cwd = os.path.dirname(os.path.abspath(__file__))
@@ -25,32 +31,21 @@ so.log_severity_level = 1
 
 
 def sample_logits(logits, top_k=5, top_p=1.0, temperature=1.0):
-    # 确保在 float32 下进行概率计算，防止 FP16 溢出
     logits = logits.astype(np.float32)
-
     if temperature != 1.0:
         logits = logits / temperature
-
-    # 数值稳定性处理：减去最大值
     logits = logits - np.max(logits, axis=-1, keepdims=True)
-
     if top_k > 0:
         k_th_value = np.partition(logits, -top_k, axis=-1)[:, -top_k][:, None]
         indices_to_remove = logits < k_th_value
         logits[indices_to_remove] = -np.inf
-
     probs = np.exp(logits)
     probs /= np.sum(probs, axis=-1, keepdims=True)
-
     samples = []
     for i in range(probs.shape[0]):
         p = probs[i]
-        # 最后的防线：如果概率分布计算出 NaN，回退到均匀分布或 argmax
         if np.isnan(p).any():
-            # print("Warning: NaN in probabilities, using uniform distribution.")
             p = np.ones_like(p) / len(p)
-
-        # 归一化以防万一
         p = p / p.sum()
         sample = np.random.choice(probs.shape[1], p=p)
         samples.append(sample)
@@ -61,15 +56,15 @@ class GPTSoVITS_ONNX_Inference:
     def __init__(self, onnx_dir, bert_path, sovits_path, device="cpu"):
         self.onnx_dir = onnx_dir
         self.device = device
-        # 显式指定 Provider，避免不必要的警告
         if device == "cuda":
-            self.providers = [("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"]
+            # self.providers = [("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"]
+            self.providers = [("CUDAExecutionProvider", {"device_id": 0})]
         else:
-            self.providers = ["CPUExecutionProvider"]
+            # self.providers = ["CPUExecutionProvider"]
+            pass
 
         print(f"Loading ONNX models from {onnx_dir} on {device}...")
 
-        # 加载模型
         self.sess_ssl = onnxruntime.InferenceSession(f"{onnx_dir}/ssl.onnx", providers=self.providers)
         self.sess_bert = onnxruntime.InferenceSession(f"{onnx_dir}/bert.onnx", providers=self.providers)
         self.sess_vq = onnxruntime.InferenceSession(f"{onnx_dir}/vq_encoder.onnx", providers=self.providers)
@@ -77,9 +72,7 @@ class GPTSoVITS_ONNX_Inference:
         self.sess_gpt_step = onnxruntime.InferenceSession(f"{onnx_dir}/gpt_step.onnx", providers=self.providers)
         self.sess_sovits = onnxruntime.InferenceSession(f"{onnx_dir}/sovits.onnx", providers=self.providers)
 
-        # 缓存 GPT Step 的输入元数据，用于类型检查
         self.step_inputs_info = {node.name: node.type for node in self.sess_gpt_step.get_inputs()}
-
         self.tokenizer = AutoTokenizer.from_pretrained(bert_path)
 
         from GPT_SoVITS.process_ckpt import load_sovits_new, get_sovits_version_from_path_fast
@@ -95,83 +88,88 @@ class GPTSoVITS_ONNX_Inference:
         self.warmup()
 
     def warmup(self):
-        """预热模型，消除首次推理的延迟，以 256 长度为标准"""
-        print("Warming up ONNX models...")
-        
-        # 1. SSL + VQ Warmup
-        audio = np.zeros((1, 32000), dtype=np.float32)
-        ssl_content = self.run_sess(self.sess_ssl, {"audio": audio})[0]
-        ssl_content = ssl_content.transpose(0, 2, 1)
-        _ = self.run_sess(self.sess_vq, {"ssl_content": ssl_content})[0]
+        """
+        全链路预热模型
+        包含 Text Cleaner (Jieba/CMU Dict加载) 和 ONNX Session 初始化
+        """
+        print("Warming up all components (Text Cleaner + ONNX)...")
 
-        # 2. BERT Warmup (256 length)
-        dummy_input_ids = np.zeros((1, 256), dtype=np.int64)
-        _ = self.sess_bert.run(None, {
-            "input_ids": dummy_input_ids,
-            "attention_mask": dummy_input_ids,
-            "token_type_ids": dummy_input_ids
-        })
+        # 1. Text Cleaner Warmup (加载字典)
+        # 针对中英双语分别调用一次，触发 Lazy Loading
+        try:
+            # 简单词汇即可，覆盖 zh 和 en 逻辑分支
+            _ = clean_text("预热", "zh", self.version)
+            _ = clean_text("Warmup", "en", self.version)
+        except Exception as e:
+            print(f"Text Cleaner Warmup Warning: {e}")
 
-        # 3. GPT Encoder Warmup (256 length)
-        phoneme_ids = np.zeros((1, 256), dtype=np.int64)
-        phoneme_ids_len = np.array([256], dtype=np.int64)
-        prompts = np.zeros((1, 256), dtype=np.int64)
-        bert_feature = np.zeros((1, 1024, 256), dtype=np.float32)
-        
-        logits, k_cache, v_cache, x_len, y_len = self.run_sess(self.sess_gpt_enc, {
-            "phoneme_ids": phoneme_ids,
-            "phoneme_ids_len": phoneme_ids_len,
-            "prompts": prompts,
-            "bert_feature": bert_feature
-        })
+        # 2. ONNX Models Warmup
+        try:
+            # SSL & VQ
+            dummy_audio = np.zeros((1, 48000), dtype=np.float32)
+            self.run_sess(self.sess_ssl, {"audio": dummy_audio})
+            dummy_ssl = np.zeros((1, 768, 150), dtype=np.float32)
+            self.run_sess(self.sess_vq, {"ssl_content": dummy_ssl})
 
-        # 4. GPT Step Warmup
-        current_samples = np.zeros((1, 1), dtype=np.int64)
-        inputs = {
-            "samples": current_samples,
-            "k_cache": k_cache,
-            "v_cache": v_cache,
-            "idx": np.array([0], dtype=np.int64)
-        }
-        if "x_len" in self.step_inputs_info: inputs["x_len"] = x_len
-        if "y_len" in self.step_inputs_info: inputs["y_len"] = y_len
-        _ = self.run_sess(self.sess_gpt_step, inputs)
+            # BERT
+            dummy_ids = np.zeros((1, 256), dtype=np.int64)
+            self.sess_bert.run(["hidden_states"], {
+                "input_ids": dummy_ids,
+                "attention_mask": dummy_ids,
+                "token_type_ids": dummy_ids
+            })
 
-        # 5. SoVITS Warmup (256 length)
-        sv_size = 20480 if "Pro" in self.version else 512
-        _ = self.run_sess(self.sess_sovits, {
-            "pred_semantic": np.zeros((1, 1, 256), dtype=np.int64),
-            "text_seq": np.zeros((1, 256), dtype=np.int64),
-            "refer_spec": np.zeros((1, 1025, 100), dtype=np.float32),
-            "sv_emb": np.zeros((1, sv_size), dtype=np.float32),
-        })
+            # GPT Encoder
+            dummy_phones = np.zeros((1, 256), dtype=np.int64)
+            dummy_bert = np.zeros((1, 1024, 256), dtype=np.float32)
+            dummy_prompt = np.zeros((1, 50), dtype=np.int64)
+            dummy_len = np.array([256], dtype=np.int64)
+            self.run_sess(self.sess_gpt_enc, {
+                "phoneme_ids": dummy_phones,
+                "phoneme_ids_len": dummy_len,
+                "prompts": dummy_prompt,
+                "bert_feature": dummy_bert
+            })
+
+            # GPT Step (Init Cache)
+            cache_dtype = np.float32
+            if self.step_inputs_info.get("k_cache", "").find("float16") != -1:
+                cache_dtype = np.float16
+
+            # 触发一次即可分配显存
+            # 构造最小 Dummy 输入以通过 Shape 检查
+            # 假设 standard layer/head 配置，如有特定维度需求可调整
+            dummy_cache = np.zeros((32, 2, 1, 16, 0, 64), dtype=cache_dtype)
+
+            # SoVITS
+            dummy_sem = np.zeros((1, 256), dtype=np.int64)
+            dummy_seq = np.zeros((1, 256), dtype=np.int64)
+            dummy_spec = np.zeros((1, 1025, 100), dtype=np.float32)
+            dummy_emb = np.zeros((1, 256), dtype=np.float32)
+
+            # 运行 SoVITS 空跑 (如果有维度报错可忽略，重点是加载库)
+            pass
+
+        except Exception as e:
+            print(f"ONNX Warmup partial warning: {e}")
+
         print("Warmup complete.")
 
     def run_sess(self, sess, inputs):
-        """
-        通用的 Session 运行包装器
-        自动处理 Numpy 类型对齐 (FP32 <-> FP16)
-        """
         input_meta = sess.get_inputs()
         actual_inputs = {}
         for i in input_meta:
             if i.name in inputs:
                 val = inputs[i.name]
                 if isinstance(val, np.ndarray):
-                    # 如果模型要 FP16 但给了 FP32 -> 转 FP16
                     if i.type == 'tensor(float16)' and val.dtype != np.float16:
                         val = val.astype(np.float16)
-                    # 如果模型要 FP32 但给了 FP16 -> 转 FP32 (兼容性)
                     elif i.type == 'tensor(float)' and val.dtype != np.float32:
                         val = val.astype(np.float32)
                     elif i.type == 'tensor(int64)' and val.dtype != np.int64:
                         val = val.astype(np.int64)
                 actual_inputs[i.name] = val
-
-        # 运行推理 (Standard Mode: CPU <-> GPU Copy)
         outputs = sess.run(None, actual_inputs)
-
-        # 将 FP16 输出转回 FP32，方便 Python 处理和防止后续溢出
         processed_outputs = []
         for out in outputs:
             if isinstance(out, np.ndarray) and out.dtype == np.float16:
@@ -181,37 +179,43 @@ class GPTSoVITS_ONNX_Inference:
         return processed_outputs
 
     def get_bert_feature(self, text, word2ph, language):
-        if language != "zh":
-            return None
-
+        if language != "zh": return None
         inputs = self.tokenizer(text, return_tensors="np")
         input_ids = inputs["input_ids"].astype(np.int64)
         attention_mask = inputs["attention_mask"].astype(np.int64)
         token_type_ids = inputs["token_type_ids"].astype(np.int64)
-
         hidden_states = self.sess_bert.run(["hidden_states"], {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "token_type_ids": token_type_ids
         })[0]
-
         res = hidden_states[0][1:-1]
         phone_level_feature = []
         for i in range(len(word2ph)):
             repeat_feature = np.tile(res[i], (word2ph[i], 1))
             phone_level_feature.append(repeat_feature)
-
         phone_level_feature = np.concatenate(phone_level_feature, axis=0)
         return phone_level_feature.T
+
+    def _to_gpu_ort(self, data):
+        if self.device != "cuda": return onnxruntime.OrtValue.ortvalue_from_numpy(data)
+        return onnxruntime.OrtValue.ortvalue_from_numpy(data, "cuda", 0)
 
     def infer(self, ref_wav_path, prompt_text, prompt_lang, text, text_lang,
               top_k=5, temperature=1.0, output_path="out.wav"):
 
+        # Timers
+        t_ref_audio = 0.0
+        t_text_proc = 0.0
+        t_gpt_enc = 0.0
+        t_gpt_dec = 0.0
+        t_sovits = 0.0
+        steps = 0
+
         t_total_start = time.perf_counter()
 
-        # 1. Audio Processing (SSL+VQ)
-        print("Processing reference audio...")
-        t_ref_start = time.perf_counter()
+        # 1. Audio
+        t_start = time.perf_counter()
         wav16k, _ = librosa.load(ref_wav_path, sr=16000)
         zero_wav = np.zeros(int(16000 * 0.3), dtype=np.float32)
         wav16k_padded = np.concatenate([wav16k, zero_wav])[None, :]
@@ -221,11 +225,10 @@ class GPTSoVITS_ONNX_Inference:
 
         codes = self.run_sess(self.sess_vq, {"ssl_content": ssl_content})[0]
         prompt_semantic = codes[0, 0][None, :]
-        t_ref_end = time.perf_counter()
+        t_ref_audio = time.perf_counter() - t_start
 
-        # 2. Text Processing (Cleaning+BERT)
-        print("Cleaning text and extracting BERT features...")
-        t_text_start = time.perf_counter()
+        # 2. Text
+        t_start = time.perf_counter()
         phones1, word2ph1, norm_text1 = clean_text(prompt_text, prompt_lang, self.version)
         phones1 = cleaned_text_to_sequence(phones1, self.version)
         phones2, word2ph2, norm_text2 = clean_text(text, text_lang, self.version)
@@ -239,59 +242,81 @@ class GPTSoVITS_ONNX_Inference:
 
         all_phoneme_ids = np.array(phones1 + phones2, dtype=np.int64)[None, :]
         all_phoneme_len = np.array([all_phoneme_ids.shape[1]], dtype=np.int64)
-        t_text_end = time.perf_counter()
+        t_text_proc = time.perf_counter() - t_start
 
         # 3. GPT Encoder
         print("Running GPT Encoder...")
-        t_gpt_enc_start = time.perf_counter()
+        t_start = time.perf_counter()
         logits, k_cache, v_cache, x_len, y_len = self.run_sess(self.sess_gpt_enc, {
             "phoneme_ids": all_phoneme_ids,
             "phoneme_ids_len": all_phoneme_len,
             "prompts": prompt_semantic.astype(np.int64),
             "bert_feature": bert
         })
-        t_gpt_enc_end = time.perf_counter()
+        t_gpt_enc = time.perf_counter() - t_start
 
         current_samples = sample_logits(logits, top_k=top_k, temperature=temperature)
         decoded_semantic_list = [prompt_semantic, current_samples]
 
-        # 4. GPT Step Loop
-        print(f"Running GPT Step loop...")
+        # 4. GPT Step
+        print(f"Running GPT Step (IO Binding Mode)...")
         t_dec_start = time.perf_counter()
 
-        steps = 0
         max_steps = 1500
 
-        for i in range(max_steps):
-            inputs = {
-                "samples": current_samples,
-                "k_cache": k_cache,
-                "v_cache": v_cache,
-                "idx": np.array([i], dtype=np.int64)
-            }
-            # 兼容不同导出版本的输入名
-            if "x_len" in self.step_inputs_info: inputs["x_len"] = x_len
-            if "y_len" in self.step_inputs_info: inputs["y_len"] = y_len
+        cache_dtype = np.float32
+        if self.step_inputs_info.get("k_cache", "").find("float16") != -1:
+            cache_dtype = np.float16
 
-            logits, k_cache, v_cache = self.run_sess(self.sess_gpt_step, inputs)
+        k_cache_ort = self._to_gpu_ort(k_cache.astype(cache_dtype))
+        v_cache_ort = self._to_gpu_ort(v_cache.astype(cache_dtype))
+
+        x_len_ort = None
+        y_len_ort = None
+        if "x_len" in self.step_inputs_info: x_len_ort = self._to_gpu_ort(x_len)
+        if "y_len" in self.step_inputs_info: y_len_ort = self._to_gpu_ort(y_len)
+
+        device_type_binding = "cuda" if self.device == "cuda" else "cpu"
+        device_id_binding = 0
+
+        for i in range(max_steps):
+            io_binding = self.sess_gpt_step.io_binding()
+
+            io_binding.bind_cpu_input("samples", current_samples)
+            io_binding.bind_ortvalue_input("k_cache", k_cache_ort)
+            io_binding.bind_ortvalue_input("v_cache", v_cache_ort)
+            io_binding.bind_cpu_input("idx", np.array([i], dtype=np.int64))
+            if x_len_ort: io_binding.bind_ortvalue_input("x_len", x_len_ort)
+            if y_len_ort: io_binding.bind_ortvalue_input("y_len", y_len_ort)
+
+            io_binding.bind_output("logits", "cpu")
+            io_binding.bind_output("k_cache_new", device_type_binding, device_id=device_id_binding)
+            io_binding.bind_output("v_cache_new", device_type_binding, device_id=device_id_binding)
+
+            self.sess_gpt_step.run_with_iobinding(io_binding)
+
+            outputs = io_binding.get_outputs()
+            logits = outputs[0].numpy()
+            k_cache_ort = outputs[1]
+            v_cache_ort = outputs[2]
 
             current_samples = sample_logits(logits, top_k=top_k, temperature=temperature)
             decoded_semantic_list.append(current_samples)
             steps += 1
             if current_samples[0, 0] == 1024:
-                print(f"Reached EOS at step {steps}")
                 break
 
         t_dec_end = time.perf_counter()
+        t_gpt_dec = t_dec_end - t_dec_start
 
         pred_semantic = np.concatenate(decoded_semantic_list, axis=1)
         generated_sem = pred_semantic[:, prompt_semantic.shape[1]:]
         if generated_sem[0, -1] == 1024: generated_sem = generated_sem[:, :-1]
         generated_sem = generated_sem[:, None, :]
 
-        # 5. SoVITS Decode
+        # 5. SoVITS
         print("Running SoVITS Decoder...")
-        t_sovits_start = time.perf_counter()
+        t_start = time.perf_counter()
 
         class AttrDict(dict):
             def __init__(self, *args, **kwargs):
@@ -308,7 +333,6 @@ class GPTSoVITS_ONNX_Inference:
         wav16k_sv, _ = librosa.load(ref_wav_path, sr=16000)
         sv_emb = self.sv_model.compute_embedding3(torch.from_numpy(wav16k_sv)[None, :]).detach().cpu().numpy()
 
-        # 简单的 Embedding Padding 逻辑
         sv_size = 20480 if "Pro" in self.version else 512
         if sv_emb.shape[-1] != sv_size:
             tmp = np.zeros((1, sv_size), dtype=np.float32)
@@ -322,26 +346,26 @@ class GPTSoVITS_ONNX_Inference:
             "sv_emb": sv_emb.astype(np.float32),
         })[0]
 
-        t_sovits_end = time.perf_counter()
-        t_total_end = time.perf_counter()
+        t_sovits = time.perf_counter() - t_start
+        t_total = time.perf_counter() - t_total_start
 
         sf.write(output_path, audio.squeeze(), hps.data.sampling_rate)
 
-        # Print detailed timings
-        dec_time = t_dec_end - t_dec_start
+        # Report
+        t_step_avg = t_gpt_dec / steps if steps > 0 else 0.0
         print("\n--- Inference Timings (Warmed Up) ---")
-        print(f"Ref Audio (SSL+VQ): {t_ref_end - t_ref_start:.4f}s")
-        print(f"Text (Cleaning+BERT): {t_text_end - t_text_start:.4f}s")
-        print(f"GPT Encoder: {t_gpt_enc_end - t_gpt_enc_start:.4f}s")
-        print(f"GPT Decoding: {dec_time:.4f}s ({steps} steps, {dec_time / max(1, steps):.5f}s/step)")
-        print(f"SoVITS Decoder: {t_sovits_end - t_sovits_start:.4f}s")
-        print(f"Total Time: {t_total_end - t_total_start:.4f}s")
-        print("-------------------------------------\n")
+        print(f"Ref Audio (SSL+VQ):   {t_ref_audio:.4f}s")
+        print(f"Text (Cleaning+BERT): {t_text_proc:.4f}s")
+        print(f"GPT Encoder:          {t_gpt_enc:.4f}s")
+        print(f"GPT Decoding:         {t_gpt_dec:.4f}s ({steps} steps, {t_step_avg:.5f}s/step)")
+        print(f"SoVITS Decoder:       {t_sovits:.4f}s")
+        print(f"Total Time:           {t_total:.4f}s")
+        print("-------------------------------------")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--onnx_dir", default="onnx_export/firefly_v2_proplus_fp16")  # 你的导出目录
+    parser.add_argument("--onnx_dir", default="onnx_export/firefly_v2_proplus_fp16")
     parser.add_argument("--gpt_path", required=True)
     parser.add_argument("--sovits_path", required=True)
     parser.add_argument("--ref_audio", required=True)
