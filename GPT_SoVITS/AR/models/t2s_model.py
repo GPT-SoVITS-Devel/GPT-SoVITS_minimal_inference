@@ -183,27 +183,45 @@ class T2SBlock:
         v_cache: torch.Tensor,
         attn_mask: torch.Tensor = None,
         torch_sdpa: bool = True,
+        idx: torch.Tensor = None,
     ):
         qkv = F.linear(x, self.qkv_w, self.qkv_b)
         q = qkv[:, :, :self.hidden_dim]
         k = qkv[:, :, self.hidden_dim:self.hidden_dim*2]
         v = qkv[:, :, self.hidden_dim*2:]
 
-        k_cache = torch.cat([k_cache, k], dim=1)
-        v_cache = torch.cat([v_cache, v], dim=1)
+        if idx is not None:
+            # Ensure idx is 1-D for ONNX Slice/Scatter compatibility
+            idx_1d = idx.reshape(-1)
+            idx_s = idx_1d[0]
+            
+            # Use scatter for out-of-place update
+            # index needs to be [B, 1, D]
+            index = idx_s.view(1, 1, 1).expand(k.shape[0], 1, k.shape[2])
+            k_cache = k_cache.scatter(1, index, k)
+            v_cache = v_cache.scatter(1, index, v)
+        else:
+            k_cache = torch.cat([k_cache, k], dim=1)
+            v_cache = torch.cat([v_cache, v], dim=1)
 
         batch_size = q.shape[0]
         # q_len = q.shape[1]
         # kv_len = k_cache.shape[1]
 
         q = q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k_cache.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v_cache.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        if idx is not None:
+            # Use narrow or explicit 1-D end for ONNX Slice node
+            # narrow(dimension, start, length)
+            k_att = k_cache.narrow(1, 0, idx_s + 1).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+            v_att = v_cache.narrow(1, 0, idx_s + 1).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        else:
+            k_att = k_cache.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+            v_att = v_cache.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
         if torch_sdpa:
-            attn = F.scaled_dot_product_attention(q, k, v, (~attn_mask) if attn_mask is not None else None)
+            attn = F.scaled_dot_product_attention(q, k_att, v_att, (~attn_mask) if attn_mask is not None else None)
         else:
-            attn = scaled_dot_product_attention(q, k, v, attn_mask)
+            attn = scaled_dot_product_attention(q, k_att, v_att, attn_mask)
 
         attn = attn.transpose(1, 2).reshape(batch_size, 1, self.hidden_dim)
         attn = F.linear(attn, self.out_w, self.out_b)
@@ -256,10 +274,11 @@ class T2STransformer(nn.Module):
         v_cache: List[torch.Tensor],
         attn_mask: torch.Tensor = None,
         torch_sdpa: bool = True,
+        idx: torch.Tensor = None,
     ):
         for i in range(self.num_blocks):
             x, k_cache[i], v_cache[i] = self.blocks[i].decode_next_token(
-                x, k_cache[i], v_cache[i], attn_mask, torch_sdpa
+                x, k_cache[i], v_cache[i], attn_mask, torch_sdpa, idx
             )
         return x, k_cache, v_cache
 
@@ -1044,7 +1063,7 @@ class Text2SemanticDecoder(nn.Module):
         pe_slice = self.ar_audio_position.pe.index_select(1, index)
         xy_pos = y_emb * self.ar_audio_position.x_scale + self.ar_audio_position.alpha * pe_slice.to(dtype=y_emb.dtype, device=y_emb.device)
 
-        xy_dec, k_cache, v_cache = self.t2s_transformer.decode_next_token(xy_pos, k_cache, v_cache)
+        xy_dec, k_cache, v_cache = self.t2s_transformer.decode_next_token(xy_pos, k_cache, v_cache, idx=pos)
         logits = self.ar_predict_layer(xy_dec[:, -1])
         
         return logits, k_cache, v_cache

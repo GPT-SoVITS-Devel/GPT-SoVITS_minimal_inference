@@ -1,8 +1,9 @@
+import argparse
 import os
 import sys
 import torch
-import argparse
 from torch import nn
+from torch.nn import functional as F
 from GPT_SoVITS.process_ckpt import load_sovits_new, get_sovits_version_from_path_fast
 from GPT_SoVITS.feature_extractor import cnhubert
 from GPT_SoVITS.AR.models.t2s_lightning_module import Text2SemanticLightningModule
@@ -36,11 +37,17 @@ class GPTEncoder(nn.Module):
             phoneme_ids, phoneme_ids_len, prompts, bert_feature
         )
         
-        # Stack caches: List[Tensor] -> Tensor [Layers, B, H, T, D]
+        # Stack caches: List[Tensor] -> Tensor [Layers, B, T, D]
         k_cache_stacked = torch.stack(k_cache, dim=0)
         v_cache_stacked = torch.stack(v_cache, dim=0)
         
-        return logits, k_cache_stacked, v_cache_stacked, x_len, y_len
+        # Pad to max length for pre-allocation
+        # Use a large enough constant or make it configurable. 1500 + max_prompt_len
+        max_len = 2000
+        k_cache_padded = F.pad(k_cache_stacked, (0, 0, 0, max_len - k_cache_stacked.shape[2]))
+        v_cache_padded = F.pad(v_cache_stacked, (0, 0, 0, max_len - v_cache_stacked.shape[2]))
+        
+        return logits, k_cache_padded, v_cache_padded, x_len, y_len
 
 class GPTStep(nn.Module):
     def __init__(self, t2s_model):
@@ -49,7 +56,7 @@ class GPTStep(nn.Module):
 
     def forward(self, samples, k_cache, v_cache, x_len, y_len, idx):
         # Wrapper for infer_next_stage
-        # k_cache, v_cache are stacked [Layers, B, H, T, D]
+        # k_cache, v_cache are stacked [Layers, B, T_max, D]
         
         # Unstack to list
         k_cache_list = [t for t in k_cache]
@@ -59,7 +66,7 @@ class GPTStep(nn.Module):
             samples, k_cache_list, v_cache_list, x_len, y_len, idx
         )
         
-        # Stack again
+        # Stack again (they should still be the same tensors if updated in-place)
         k_cache_stacked = torch.stack(k_cache_new, dim=0)
         v_cache_stacked = torch.stack(v_cache_new, dim=0)
         
@@ -92,6 +99,7 @@ class VQEncoder(nn.Module):
         return codes
 
 def export_onnx(args):
+    torch.set_grad_enabled(False)
     device = "cpu" # Export on CPU usually safer for dynamic axes
     
     print("Loading models...")
@@ -221,6 +229,8 @@ def export_onnx(args):
         "phoneme_ids": {1: "text_len"},
         "prompts": {1: "prompt_len"},
         "bert_feature": {2: "text_len"},
+        "k_cache": {1: "batch_size"},
+        "v_cache": {1: "batch_size"},
     }
     
     torch.onnx.export(
@@ -240,13 +250,13 @@ def export_onnx(args):
         logits, k_cache, v_cache, x_len, y_len = gpt_enc(phoneme_ids, phoneme_ids_len, prompts, bert_feature)
     
     gpt_step = GPTStep(t2s_model)
-    idx = torch.tensor(0, dtype=torch.long)
+    idx = torch.tensor([0], dtype=torch.long)
     # samples input for step is indices [B, 1]
     samples = torch.randint(0, 1024, (1, 1), dtype=torch.long)
     
     dynamic_axes_step = {
-        "k_cache": {2: "cache_len"},
-        "v_cache": {2: "cache_len"},
+        "k_cache": {1: "batch_size"},
+        "v_cache": {1: "batch_size"},
     }
     
     torch.onnx.export(
