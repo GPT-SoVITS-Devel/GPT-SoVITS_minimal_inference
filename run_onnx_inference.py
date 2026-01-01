@@ -29,27 +29,21 @@ from GPT_SoVITS.module.mel_processing import spectrogram_torch
 from GPT_SoVITS.sv import SV
 
 
-def sample_logits(logits, top_k=5, top_p=1.0, temperature=1.0):
-    logits = logits.astype(np.float32)
+def sample_topk(topk_values, topk_indices, temperature=1.0):
+    # topk_values: [B, K], topk_indices: [B, K]
     if temperature != 1.0:
-        logits = logits / temperature
-    logits = logits - np.max(logits, axis=-1, keepdims=True)
-    if top_k > 0:
-        k_th_value = np.partition(logits, -top_k, axis=-1)[:, -top_k][:, None]
-        indices_to_remove = logits < k_th_value
-        logits[indices_to_remove] = -np.inf
-    probs = np.exp(logits)
+        topk_values = topk_values / temperature
+    
+    # Softmax over top-k
+    topk_values = topk_values - np.max(topk_values, axis=-1, keepdims=True)
+    probs = np.exp(topk_values)
     probs /= np.sum(probs, axis=-1, keepdims=True)
+    
     samples = []
     for i in range(probs.shape[0]):
-        p = probs[i]
-        if np.isnan(p).any():
-            p = np.ones_like(p) / len(p)
-        p = p / p.sum()
-        sample = np.random.choice(probs.shape[1], p=p)
-        samples.append(sample)
+        choice = np.random.choice(len(probs[i]), p=probs[i])
+        samples.append(topk_indices[i, choice])
     return np.array(samples, dtype=np.int64)[:, None]
-
 
 class GPTSoVITS_ONNX_Inference:
     def __init__(self, onnx_dir, bert_path, sovits_path, device="cpu"):
@@ -57,19 +51,10 @@ class GPTSoVITS_ONNX_Inference:
         self.device = device
         
         so = onnxruntime.SessionOptions()
-        so.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
-        # so.log_severity_level = 1
-        # so = None
-        sol = onnxruntime.SessionOptions()
-        # sol.log_severity_level = 1
-        # sol = None
-        # Prevent aggressive CPU fallback heuristics by limiting optimization level
-        # so.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
-        # sol.enable_profiling = True
-        # sol.profile_file_prefix = "gpt_profile"
-
+        so.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        
         if device == "cuda":
-            self.providers = [("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"]
+            self.providers = [("CUDAExecutionProvider", {"device_id": 0, "arena_extend_strategy": "kSameAsRequested"}), "CPUExecutionProvider"]
         else:
             self.providers = ["CPUExecutionProvider"]
         
@@ -81,14 +66,18 @@ class GPTSoVITS_ONNX_Inference:
                                                     providers=self.providers)
         self.sess_gpt_enc = onnxruntime.InferenceSession(f"{onnx_dir}/gpt_encoder.onnx", sess_options=so,
                                                          providers=self.providers)
-        self.sess_gpt_step = onnxruntime.InferenceSession(f"{onnx_dir}/gpt_step.onnx", sess_options=so,
+        self.sess_gpt_step = onnxruntime.InferenceSession(f"{onnx_dir}/gpt_step.onnx", sess_options=sol,
                                                           providers=self.providers)
 
         self.sess_sovits = onnxruntime.InferenceSession(f"{onnx_dir}/sovits.onnx", sess_options=so,
                                                         providers=self.providers)
 
         self.step_inputs_info = {node.name: node.type for node in self.sess_gpt_step.get_inputs()}
+        self.step_outputs_info = {node.name: node.type for node in self.sess_gpt_step.get_outputs()}
         self.tokenizer = AutoTokenizer.from_pretrained(bert_path)
+        
+        # Pre-allocate IOBinding for GPT Step to reuse
+        self.step_io_binding = self.sess_gpt_step.io_binding()
 
         from GPT_SoVITS.process_ckpt import load_sovits_new, get_sovits_version_from_path_fast
         dict_s2 = load_sovits_new(sovits_path)
@@ -162,11 +151,6 @@ class GPTSoVITS_ONNX_Inference:
                 "prompts": dummy_prompt,
                 "bert_feature": dummy_bert
             })
-
-            # GPT Step (Init Cache)
-            cache_dtype = np.float32
-            if self.step_inputs_info.get("k_cache", "").find("float16") != -1:
-                cache_dtype = np.float16
 
             # SV Model Warmup (PyTorch)
             print("  - Warming up SV model...")
@@ -355,7 +339,7 @@ class GPTSoVITS_ONNX_Inference:
         # 3. GPT Encoder
         print("Running GPT Encoder...")
         t_start = time.perf_counter()
-        logits, k_cache, v_cache, x_len, y_len = self.run_sess(self.sess_gpt_enc, {
+        topk_values, topk_indices, k_cache, v_cache, x_len, y_len = self.run_sess(self.sess_gpt_enc, {
             "phoneme_ids": all_phoneme_ids,
             "phoneme_ids_len": all_phoneme_len,
             "prompts": prompt_semantic.astype(np.int64),
@@ -363,56 +347,65 @@ class GPTSoVITS_ONNX_Inference:
         })
         t_gpt_enc = time.perf_counter() - t_start
 
-        current_samples = sample_logits(logits, top_k=top_k, temperature=temperature)
+        current_samples = sample_topk(topk_values, topk_indices, temperature=temperature)
         decoded_semantic_list = [prompt_semantic, current_samples]
 
         # 4. GPT Step
-        print(f"Running GPT Step (IO Binding Mode)...")
+        print(f"Running GPT Step (Massive Parallel Optimized)...")
         t_dec_start = time.perf_counter()
 
         max_steps = 1500
-
         cache_dtype = np.float32
         if self.step_inputs_info.get("k_cache", "").find("float16") != -1:
             cache_dtype = np.float16
 
-        k_cache_ort = self._to_gpu_ort(k_cache.astype(cache_dtype))
-        v_cache_ort = self._to_gpu_ort(v_cache.astype(cache_dtype))
+        # Pre-allocate Ping-Pong caches to avoid allocation in loop
+        k_cache_ort_0 = self._to_gpu_ort(k_cache.astype(cache_dtype))
+        v_cache_ort_0 = self._to_gpu_ort(v_cache.astype(cache_dtype))
+        # Note: We need a second buffer because scatter is out-of-place in ONNX
+        k_cache_ort_1 = self._to_gpu_ort(k_cache.astype(cache_dtype))
+        v_cache_ort_1 = self._to_gpu_ort(v_cache.astype(cache_dtype))
+        
+        caches = [(k_cache_ort_0, v_cache_ort_0), (k_cache_ort_1, v_cache_ort_1)]
 
-        x_len_ort = None
-        y_len_ort = None
-        if "x_len" in self.step_inputs_info: x_len_ort = self._to_gpu_ort(x_len)
-        if "y_len" in self.step_inputs_info: y_len_ort = self._to_gpu_ort(y_len)
+        x_len_ort = self._to_gpu_ort(x_len)
+        y_len_ort = self._to_gpu_ort(y_len)
 
         device_type_binding = "cuda" if self.device == "cuda" else "cpu"
         device_id_binding = 0
+        
+        io_binding = self.step_io_binding
 
         for i in range(max_steps):
-            io_binding = self.sess_gpt_step.io_binding()
-
+            # Input/Output Ping-Pong
+            src_cache = caches[i % 2]
+            dst_cache = caches[(i + 1) % 2]
+            
             samples_ort = self._to_gpu_ort(current_samples)
-            io_binding.bind_ortvalue_input("samples", samples_ort)
-            io_binding.bind_ortvalue_input("k_cache", k_cache_ort)
-            io_binding.bind_ortvalue_input("v_cache", v_cache_ort)
-
             idx_ort = self._to_gpu_ort(np.array([i], dtype=np.int64))
+            
+            io_binding.bind_ortvalue_input("samples", samples_ort)
+            io_binding.bind_ortvalue_input("k_cache", src_cache[0])
+            io_binding.bind_ortvalue_input("v_cache", src_cache[1])
             io_binding.bind_ortvalue_input("idx", idx_ort)
+            io_binding.bind_ortvalue_input("x_len", x_len_ort)
+            io_binding.bind_ortvalue_input("y_len", y_len_ort)
 
-            if x_len_ort: io_binding.bind_ortvalue_input("x_len", x_len_ort)
-            if y_len_ort: io_binding.bind_ortvalue_input("y_len", y_len_ort)
-
-            io_binding.bind_output("logits", "cpu")
-            io_binding.bind_output("k_cache_new", device_type_binding, device_id=device_id_binding)
-            io_binding.bind_output("v_cache_new", device_type_binding, device_id=device_id_binding)
+            # Bind outputs - k_cache_new/v_cache_new bound to the OTHER buffer
+            io_binding.bind_output("topk_values", "cpu")
+            io_binding.bind_output("topk_indices", "cpu")
+            io_binding.bind_ortvalue_output("k_cache_new", dst_cache[0])
+            io_binding.bind_ortvalue_output("v_cache_new", dst_cache[1])
 
             self.sess_gpt_step.run_with_iobinding(io_binding)
 
             outputs = io_binding.get_outputs()
-            logits = outputs[0].numpy()
-            k_cache_ort = outputs[1]
-            v_cache_ort = outputs[2]
+            topk_values = outputs[0].numpy()
+            topk_indices = outputs[1].numpy()
 
-            current_samples = sample_logits(logits, top_k=top_k, temperature=temperature)
+            # Sampling from Top-K (Much faster as transfer size is small)
+            current_samples = sample_topk(topk_values, topk_indices, temperature=temperature)
+            
             decoded_semantic_list.append(current_samples)
             steps += 1
             if current_samples[0, 0] == 1024:
@@ -469,7 +462,7 @@ class GPTSoVITS_ONNX_Inference:
         print(f"Ref Audio (SSL+VQ):   {t_ref_audio:.4f}s")
         print(f"Text (Cleaning+BERT): {t_text_proc:.4f}s")
         print(f"GPT Encoder:          {t_gpt_enc:.4f}s")
-        print(f"GPT Decoding:         {t_gpt_dec:.4f}s ({steps} steps, {t_step_avg:.5f}s/step)")
+        print(f"GPT Decoding:         {t_gpt_dec:.4f}s ({steps} steps, {t_step_avg:.5f}s/step, {1/t_step_avg:.2f}step/s)")
         print(f"SoVITS Decoder:       {t_sovits:.4f}s")
         print(f"Total Time:           {t_total:.4f}s")
         print("-------------------------------------")

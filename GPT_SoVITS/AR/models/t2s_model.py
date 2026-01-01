@@ -1055,15 +1055,17 @@ class Text2SemanticDecoder(nn.Module):
         idx: int, # current step index starting from 0 (relative to generated)
     ):
         y_emb = self.ar_audio_embedding(samples)
-        # Calculate position encoding
-        # In loop: xy_pos = y_emb * scale + alpha * pe[:, y_len + idx]
+        # Calculate position encoding for the 'y' stream (prompt + generated)
         pos = y_len + idx
-        # Ensure pos is 1-D for index_select which is robust for ONNX
+        # Calculate absolute index in the combined cache [x | y]
+        cache_idx = x_len + y_len + idx
+        
+        # Ensure pos is 1-D for index_select
         index = pos.reshape(-1)
         pe_slice = self.ar_audio_position.pe.index_select(1, index)
         xy_pos = y_emb * self.ar_audio_position.x_scale + self.ar_audio_position.alpha * pe_slice.to(dtype=y_emb.dtype, device=y_emb.device)
 
-        xy_dec, k_cache, v_cache = self.t2s_transformer.decode_next_token(xy_pos, k_cache, v_cache, idx=pos)
+        xy_dec, k_cache, v_cache = self.t2s_transformer.decode_next_token(xy_pos, k_cache, v_cache, idx=cache_idx)
         logits = self.ar_predict_layer(xy_dec[:, -1])
         
         return logits, k_cache, v_cache

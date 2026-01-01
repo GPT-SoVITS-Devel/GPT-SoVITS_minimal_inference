@@ -26,9 +26,10 @@ class T2SEncoder(nn.Module):
         pass
 
 class GPTEncoder(nn.Module):
-    def __init__(self, t2s_model):
+    def __init__(self, t2s_model, max_len=2000):
         super().__init__()
         self.t2s_model = t2s_model
+        self.max_len = max_len
 
     def forward(self, phoneme_ids, phoneme_ids_len, prompts, bert_feature):
         # Wrapper for infer_first_stage
@@ -42,12 +43,13 @@ class GPTEncoder(nn.Module):
         v_cache_stacked = torch.stack(v_cache, dim=0)
         
         # Pad to max length for pre-allocation
-        # Use a large enough constant or make it configurable. 1500 + max_prompt_len
-        max_len = 2000
-        k_cache_padded = F.pad(k_cache_stacked, (0, 0, 0, max_len - k_cache_stacked.shape[2]))
-        v_cache_padded = F.pad(v_cache_stacked, (0, 0, 0, max_len - v_cache_stacked.shape[2]))
+        k_cache_padded = F.pad(k_cache_stacked, (0, 0, 0, self.max_len - k_cache_stacked.shape[2]))
+        v_cache_padded = F.pad(v_cache_stacked, (0, 0, 0, self.max_len - v_cache_stacked.shape[2]))
         
-        return logits, k_cache_padded, v_cache_padded, x_len, y_len
+        # Optimization: Return Top-K instead of full logits
+        topk_values, topk_indices = torch.topk(logits, k=50, dim=-1)
+        
+        return topk_values, topk_indices, k_cache_padded, v_cache_padded, x_len, y_len
 
 class GPTStep(nn.Module):
     def __init__(self, t2s_model):
@@ -70,7 +72,11 @@ class GPTStep(nn.Module):
         k_cache_stacked = torch.stack(k_cache_new, dim=0)
         v_cache_stacked = torch.stack(v_cache_new, dim=0)
         
-        return logits, k_cache_stacked, v_cache_stacked
+        # Optimization: Return Top-K instead of full logits to reduce GPU->CPU transfer
+        # SoVITS vocabulary is 1025. Returning Top-50 is enough for high-quality sampling.
+        topk_values, topk_indices = torch.topk(logits, k=50, dim=-1)
+        
+        return topk_values, topk_indices, k_cache_stacked, v_cache_stacked
 
 class SoVITS(nn.Module):
     def __init__(self, vq_model, version):
@@ -218,7 +224,7 @@ def export_onnx(args):
     )
 
     print("Exporting GPT Encoder...")
-    gpt_enc = GPTEncoder(t2s_model)
+    gpt_enc = GPTEncoder(t2s_model, max_len=args.max_len)
     # Dummies
     phoneme_ids = torch.randint(0, 512, (1, 50), dtype=torch.long)
     phoneme_ids_len = torch.tensor([50], dtype=torch.long)
@@ -238,7 +244,7 @@ def export_onnx(args):
         (phoneme_ids, phoneme_ids_len, prompts, bert_feature),
         f"{output_dir}/gpt_encoder.onnx",
         input_names=["phoneme_ids", "phoneme_ids_len", "prompts", "bert_feature"],
-        output_names=["logits", "k_cache", "v_cache", "x_len", "y_len"],
+        output_names=["topk_values", "topk_indices", "k_cache", "v_cache", "x_len", "y_len"],
         dynamic_axes=dynamic_axes_gpt,
         opset_version=20,
         dynamo=False
@@ -247,7 +253,7 @@ def export_onnx(args):
     print("Exporting GPT Step...")
     # Get outputs from encoder to feed to step
     with torch.no_grad():
-        logits, k_cache, v_cache, x_len, y_len = gpt_enc(phoneme_ids, phoneme_ids_len, prompts, bert_feature)
+        topk_v_dummy, topk_i_dummy, k_cache, v_cache, x_len, y_len = gpt_enc(phoneme_ids, phoneme_ids_len, prompts, bert_feature)
     
     gpt_step = GPTStep(t2s_model)
     idx = torch.tensor([0], dtype=torch.long)
@@ -264,7 +270,7 @@ def export_onnx(args):
         (samples, k_cache, v_cache, x_len, y_len, idx),
         f"{output_dir}/gpt_step.onnx",
         input_names=["samples", "k_cache", "v_cache", "x_len", "y_len", "idx"],
-        output_names=["logits", "k_cache_new", "v_cache_new"],
+        output_names=["topk_values", "topk_indices", "k_cache_new", "v_cache_new"],
         dynamic_axes=dynamic_axes_step,
         opset_version=20,
         dynamo=False
@@ -312,6 +318,7 @@ if __name__ == "__main__":
     parser.add_argument("--sovits_path", required=True)
     parser.add_argument("--cnhubert_base_path", default="pretrained_models/chinese-hubert-base")
     parser.add_argument("--bert_path", default="pretrained_models/chinese-roberta-wwm-ext-large")
+    parser.add_argument("--max_len", type=int, default=2000, help="Pre-allocated KV cache length")
     parser.add_argument("--output_dir", default="onnx_export", help="Output directory for ONNX models")
     
     args = parser.parse_args()
