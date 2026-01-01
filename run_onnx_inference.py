@@ -52,7 +52,10 @@ class GPTSoVITS_ONNX_Inference:
         
         so = onnxruntime.SessionOptions()
         so.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-        
+
+        sol = onnxruntime.SessionOptions()
+        sol.log_severity_level=1
+
         if device == "cuda":
             self.providers = [("CUDAExecutionProvider", {"device_id": 0, "arena_extend_strategy": "kSameAsRequested"}), "CPUExecutionProvider"]
         else:
@@ -66,7 +69,8 @@ class GPTSoVITS_ONNX_Inference:
                                                     providers=self.providers)
         self.sess_gpt_enc = onnxruntime.InferenceSession(f"{onnx_dir}/gpt_encoder.onnx", sess_options=so,
                                                          providers=self.providers)
-        self.sess_gpt_step = onnxruntime.InferenceSession(f"{onnx_dir}/gpt_step.onnx", sess_options=sol,
+
+        self.sess_gpt_step = onnxruntime.InferenceSession(f"{onnx_dir}/gpt_step.onnx", sess_options=so,
                                                           providers=self.providers)
 
         self.sess_sovits = onnxruntime.InferenceSession(f"{onnx_dir}/sovits.onnx", sess_options=so,
@@ -311,7 +315,7 @@ class GPTSoVITS_ONNX_Inference:
 
         t_total_start = time.perf_counter()
 
-        # 1. Audio
+        # Audio
         t_start = time.perf_counter()
         wav16k, _ = librosa.load(ref_wav_path, sr=16000)
         wav16k = wav16k.astype(self.precision)
@@ -325,7 +329,7 @@ class GPTSoVITS_ONNX_Inference:
         prompt_semantic = codes[0, 0][None, :]
         t_ref_audio = time.perf_counter() - t_start
 
-        # 2. Text
+        # Text
         t_start = time.perf_counter()
         phones1, bert1, norm_text1 = self.get_phones_and_bert(prompt_text, prompt_lang, self.version)
         phones2, bert2, norm_text2 = self.get_phones_and_bert(text, text_lang, self.version)
@@ -336,7 +340,7 @@ class GPTSoVITS_ONNX_Inference:
         all_phoneme_len = np.array([all_phoneme_ids.shape[1]], dtype=np.int64)
         t_text_proc = time.perf_counter() - t_start
 
-        # 3. GPT Encoder
+        # GPT Encoder
         print("Running GPT Encoder...")
         t_start = time.perf_counter()
         topk_values, topk_indices, k_cache, v_cache, x_len, y_len = self.run_sess(self.sess_gpt_enc, {
@@ -351,7 +355,7 @@ class GPTSoVITS_ONNX_Inference:
         decoded_semantic_list = [prompt_semantic, current_samples]
 
         # 4. GPT Step
-        print(f"Running GPT Step (Massive Parallel Optimized)...")
+        print(f"Running GPT Step (Zero-Allocation Optimized)...")
         t_dec_start = time.perf_counter()
 
         max_steps = 1500
@@ -368,8 +372,10 @@ class GPTSoVITS_ONNX_Inference:
         
         caches = [(k_cache_ort_0, v_cache_ort_0), (k_cache_ort_1, v_cache_ort_1)]
 
-        x_len_ort = self._to_gpu_ort(x_len)
-        y_len_ort = self._to_gpu_ort(y_len)
+        idx_ort_list = [onnxruntime.OrtValue.ortvalue_from_numpy(np.array([i], dtype=np.int64)) for i in range(max_steps)]
+
+        x_len_ort = onnxruntime.OrtValue.ortvalue_from_numpy(x_len.astype(np.int64))
+        y_len_ort = onnxruntime.OrtValue.ortvalue_from_numpy(y_len.astype(np.int64))
 
         device_type_binding = "cuda" if self.device == "cuda" else "cpu"
         device_id_binding = 0
@@ -381,8 +387,9 @@ class GPTSoVITS_ONNX_Inference:
             src_cache = caches[i % 2]
             dst_cache = caches[(i + 1) % 2]
             
-            samples_ort = self._to_gpu_ort(current_samples)
-            idx_ort = self._to_gpu_ort(np.array([i], dtype=np.int64))
+            samples_ort = self._to_gpu_ort(current_samples.astype(np.int64))
+            # 从预分配列表中直接提取已就绪的 OrtValue
+            idx_ort = idx_ort_list[i]
             
             io_binding.bind_ortvalue_input("samples", samples_ort)
             io_binding.bind_ortvalue_input("k_cache", src_cache[0])
