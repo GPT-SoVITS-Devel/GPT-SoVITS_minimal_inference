@@ -3,7 +3,8 @@ import os
 os.environ["PATH"] = fr'D:\SDK\c++\ffmpeg\bin:{os.environ["PATH"]}'
 import torch
 
-sys.path.append(f"{os.getcwd()}/GPT_SoVITS/eres2net")
+now_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(f"{now_dir}/eres2net")
 sv_path = os.environ.get("SV_MODEL_PATH", "pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt")
 from ERes2NetV2 import ERes2NetV2
 import kaldi as Kaldi
