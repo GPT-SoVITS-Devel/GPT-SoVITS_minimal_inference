@@ -225,12 +225,11 @@ class TextEncoder(nn.Module):
         text = self.encoder_text(text * text_mask, text_mask)
         y = self.mrte(y, y_mask, text, text_mask, ge)
 
+        y = self.encoder2(y * y_mask, y_mask)
+
         if padding_length is not None and padding_length!=0:
             y = y[:, :, :-padding_length]
             y_mask = y_mask[:, :, :-padding_length]
-
-
-        y = self.encoder2(y * y_mask, y_mask)
 
         if result_length is not None:
             y = y[:, :, -result_length:]

@@ -114,36 +114,8 @@ class GPTSoVITSStreamingInference:
         self.vq_model.eval()
         self.vq_model.load_state_dict(dict_s2["weight"], strict=False)
 
-        # SV Model (for v2Pro/Plus)
+        # SV Model
         self.sv_model = SV(device, is_half)
-
-    def get_bert_feature(self, text, word2ph):
-        with torch.no_grad():
-            inputs = self.tokenizer(text, return_tensors="pt")
-            for i in inputs:
-                inputs[i] = inputs[i].to(self.device)
-            res = self.bert_model(**inputs, output_hidden_states=True)
-            res = torch.cat(res["hidden_states"][-3:-2], -1)[0].cpu()[1:-1]
-
-        assert len(word2ph) == len(text)
-        phone_level_feature = []
-        for i in range(len(word2ph)):
-            repeat_feature = res[i].repeat(word2ph[i], 1)
-            phone_level_feature.append(repeat_feature)
-        phone_level_feature = torch.cat(phone_level_feature, dim=0)
-        return phone_level_feature.T
-
-    def get_bert_inf(self, phones, word2ph, norm_text, language):
-        language = language.replace("all_", "")
-        if language == "zh":
-            bert = self.get_bert_feature(norm_text, word2ph).to(self.device)
-        else:
-            bert = torch.zeros(
-                (1024, len(phones)),
-                dtype=torch.float16 if self.is_half else torch.float32,
-            ).to(self.device)
-
-        return bert
 
     def get_phones_and_bert(self, text, language, version):
         import re
@@ -156,8 +128,7 @@ class GPTSoVITSStreamingInference:
                 textlist.append(tmp["text"])
         elif language == "all_yue":
             for tmp in LangSegmenter.getTexts(text, "zh"):
-                if tmp["lang"] == "zh":
-                    tmp["lang"] = "yue"
+                if tmp["lang"] == "zh": tmp["lang"] = "yue"
                 langlist.append(tmp["lang"])
                 textlist.append(tmp["text"])
         elif language == "all_ja":
@@ -177,8 +148,7 @@ class GPTSoVITSStreamingInference:
                 textlist.append(tmp["text"])
         elif language == "auto_yue":
             for tmp in LangSegmenter.getTexts(text):
-                if tmp["lang"] == "zh":
-                    tmp["lang"] = "yue"
+                if tmp["lang"] == "zh": tmp["lang"] = "yue"
                 langlist.append(tmp["lang"])
                 textlist.append(tmp["text"])
         else:
@@ -195,224 +165,155 @@ class GPTSoVITSStreamingInference:
         
         phones_list = []
         bert_list = []
-        norm_text_list = []
         for i in range(len(textlist)):
             lang = langlist[i]
             phones, word2ph, norm_text = clean_text(textlist[i], lang, version)
             phones = cleaned_text_to_sequence(phones, version)
-            bert = self.get_bert_inf(phones, word2ph, norm_text, lang)
+            
+            with torch.no_grad():
+                inputs = self.tokenizer(norm_text, return_tensors="pt")
+                for k in inputs: inputs[k] = inputs[k].to(self.device)
+                res = self.bert_model(**inputs, output_hidden_states=True)
+                res = torch.cat(res["hidden_states"][-3:-2], -1)[0].cpu()[1:-1]
+            
+            phone_level_feature = []
+            for j in range(len(word2ph)):
+                phone_level_feature.append(res[j].repeat(word2ph[j], 1))
+            bert = torch.cat(phone_level_feature, dim=0).T
+            
             phones_list.append(phones)
-            norm_text_list.append(norm_text)
             bert_list.append(bert)
         
         bert = torch.cat(bert_list, dim=1)
         phones = sum(phones_list, [])
-        norm_text = "".join(norm_text_list)
-
-        return phones, bert.to(torch.float16 if self.is_half else torch.float32), norm_text
+        return phones, bert.to(torch.float16 if self.is_half else torch.float32)
 
     def get_spepc(self, filename):
         audio, sr = load_audio_equivalent(filename, self.device)
         if sr != self.hps.data.sampling_rate:
             audio = torchaudio.transforms.Resample(sr, self.hps.data.sampling_rate).to(self.device)(audio)
-
-        if audio.shape[0] > 1:
-            audio = audio.mean(0, keepdim=True)
-
-        spec = spectrogram_torch(
-            audio,
-            self.hps.data.filter_length,
-            self.hps.data.sampling_rate,
-            self.hps.data.hop_length,
-            self.hps.data.win_length,
-            center=False
-        )
-        if self.is_half:
-            spec = spec.half()
+        if audio.shape[0] > 1: audio = audio.mean(0, keepdim=True)
+        spec = spectrogram_torch(audio, self.hps.data.filter_length, self.hps.data.sampling_rate,
+                                 self.hps.data.hop_length, self.hps.data.win_length, center=False)
+        if self.is_half: spec = spec.half()
         return spec, audio
 
     def infer_stream(self, ref_wav_path, prompt_text, prompt_lang, text, text_lang,
                     top_k=5, top_p=1, temperature=1, speed=1, chunk_length=24):
 
-        print(f"Streaming Inference: {text} ({text_lang})")
-
-        # Load Mute Matrix for natural splits
+        # 0. Load Mute Matrix
         mute_matrix_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "GPT_SoVITS/pretrained_models/gpts1_mute_emb_sim_matrix.pt")
-        mute_emb_sim_matrix = None
-        if os.path.exists(mute_matrix_path):
-            mute_emb_sim_matrix = torch.load(mute_matrix_path, map_location=self.device)
+        mute_emb_sim_matrix = torch.load(mute_matrix_path, map_location=self.device) if os.path.exists(mute_matrix_path) else None
 
-        # Process Reference
-        zero_wav = torch.zeros(
-            int(self.hps.data.sampling_rate * 0.3),
-            dtype=torch.float16 if self.is_half else torch.float32
-        ).to(self.device)
-
+        # 1. Process Reference
         with torch.no_grad():
-            wav16k, sr = librosa.load(ref_wav_path, sr=16000)
+            wav16k, _ = librosa.load(ref_wav_path, sr=16000)
             wav16k = torch.from_numpy(wav16k).to(self.device)
             if self.is_half: wav16k = wav16k.half()
+            zero_wav = torch.zeros(int(16000 * 0.3), dtype=wav16k.dtype, device=self.device)
             wav16k = torch.cat([wav16k, zero_wav])
             ssl_content = self.ssl_model.model(wav16k.unsqueeze(0))["last_hidden_state"].transpose(1, 2)
-            codes = self.vq_model.extract_latent(ssl_content)
-            prompt_semantic = codes[0, 0]
+            prompt_semantic = self.vq_model.extract_latent(ssl_content)[0, 0]
             prompt = prompt_semantic.unsqueeze(0).to(self.device)
 
-        # Process Text
-        phones1, bert1, norm_text1 = self.get_phones_and_bert(prompt_text, prompt_lang, self.hps.model.version)
-        phones2, bert2, norm_text2 = self.get_phones_and_bert(text, text_lang, self.hps.model.version)
-
+        # 2. Process Text
+        phones1, bert1 = self.get_phones_and_bert(prompt_text, prompt_lang, self.hps.model.version)
+        phones2, bert2 = self.get_phones_and_bert(text, text_lang, self.hps.model.version)
         bert = torch.cat([bert1, bert2], 1).unsqueeze(0).to(self.device)
-        all_phoneme_ids = torch.LongTensor(phones1 + phones2).to(self.device).unsqueeze(0)
-        all_phoneme_len = torch.tensor([all_phoneme_ids.shape[-1]]).to(self.device)
+        all_phones = torch.LongTensor(phones1 + phones2).to(self.device).unsqueeze(0)
+        all_phones_len = torch.tensor([all_phones.shape[-1]]).to(self.device)
 
-        # SoVITS Preparations
+        # 3. SoVITS Preparations
         refer_spec, refer_audio = self.get_spepc(ref_wav_path)
         if refer_audio.shape[0] > 1: refer_audio = refer_audio[0].unsqueeze(0)
-        if self.hps.data.sampling_rate != 16000:
-            audio_16k = torchaudio.transforms.Resample(self.hps.data.sampling_rate, 16000).to(self.device)(refer_audio)
-        else:
-            audio_16k = refer_audio
+        audio_16k = torchaudio.transforms.Resample(self.hps.data.sampling_rate, 16000).to(self.device)(refer_audio) if self.hps.data.sampling_rate != 16000 else refer_audio
         sv_emb = self.sv_model.compute_embedding3(audio_16k)
 
-        # 4. GPT Streaming Loop with Context
+        # 4. GPT Streaming Generator
         token_generator = self.t2s_model.model.infer_panel_naive(
-            all_phoneme_ids,
-            all_phoneme_len,
-            prompt,
-            bert,
-            top_k=top_k,
-            top_p=top_p,
-            temperature=temperature,
-            early_stop_num=50 * 30,
-            streaming_mode=True,
-            chunk_length=chunk_length,
-            mute_emb_sim_matrix=mute_emb_sim_matrix
+            all_phones, all_phones_len, prompt, bert, top_k=top_k, top_p=top_p,
+            temperature=temperature, early_stop_num=50 * 30, streaming_mode=True,
+            chunk_length=chunk_length, mute_emb_sim_matrix=mute_emb_sim_matrix
         )
 
         phones2_tensor = torch.LongTensor(phones2).to(self.device).unsqueeze(0)
+        sr = self.hps.data.sampling_rate
+        samples_per_token = sr // 25
+        h_len, l_len, fade_len = 16, 16, 160
+        history_tokens, prev_fade_out = None, None
         
-        history_tokens = None
-        current_tokens = None
-        
-        # h_len: context from past to stabilize the start of current chunk
-        # l_len: context from future to stabilize the end of current chunk
-        h_len = 16 
-        l_len = 16
+        # Buffer queue for lookahead
+        chunk_queue = []
 
-        for tokens_chunk, is_last in token_generator:
-            if tokens_chunk is None: continue
-            
-            if current_tokens is None:
-                current_tokens = tokens_chunk
-                if not is_last:
-                    continue
-            
-            # Now we have current_tokens to decode.
-            # tokens_chunk serves as the lookahead (future context).
-            
-            # Construct context input: history + current + lookahead
+        def decode_and_crop(tokens, hist, lookahead):
             input_list = []
-            if history_tokens is not None:
-                input_list.append(history_tokens[:, -h_len:])
-            input_list.append(current_tokens)
-            
-            # If it's the last chunk, we have no more lookahead
-            # If not, use the start of the next chunk as lookahead
-            actual_l_len = 0
-            if not is_last:
-                input_list.append(tokens_chunk[:, :l_len])
-                actual_l_len = min(tokens_chunk.shape[1], l_len)
+            if hist is not None: input_list.append(hist[:, -h_len:])
+            input_list.append(tokens)
+            if lookahead is not None: input_list.append(lookahead[:, :l_len])
             
             full_chunk = torch.cat(input_list, dim=1)
-            
-            # result_length: the part we want to KEEP (current_tokens)
-            # padding_length: the part we want to DISCARD from the end (lookahead)
-            # Units: Semantic Tokens (decode_streaming will handle Hz conversion)
-            r_len = current_tokens.shape[1]
-            p_len = actual_l_len
-            
             with torch.no_grad():
-                audio_chunk, _, _ = self.vq_model.decode_streaming(
-                    codes=full_chunk.unsqueeze(0),
-                    text=phones2_tensor,
-                    refer=[refer_spec],
-                    speed=speed,
-                    sv_emb=[sv_emb],
-                    overlap_frames=None, 
-                    padding_length=p_len,
-                    result_length=r_len
-                )
+                # We use manual cropping because our models.py modification 
+                # handles context-aware Transformer encoding perfectly.
+                audio = self.vq_model.decode(full_chunk.unsqueeze(0), phones2_tensor, [refer_spec], noise_scale=0, speed=speed, sv_emb=[sv_emb])
             
-            yield audio_chunk[0, 0].cpu().float().numpy()
-            
-            # Prepare for next iteration
-            history_tokens = current_tokens
-            current_tokens = tokens_chunk
-            
-            if is_last:
-                # The very last chunk (which was tokens_chunk) needs to be decoded
-                input_list = []
-                if history_tokens is not None:
-                    input_list.append(history_tokens[:, -h_len:])
-                input_list.append(current_tokens)
-                full_chunk = torch.cat(input_list, dim=1)
-                
-                with torch.no_grad():
-                    audio_chunk, _, _ = self.vq_model.decode_streaming(
-                        codes=full_chunk.unsqueeze(0),
-                        text=phones2_tensor,
-                        refer=[refer_spec],
-                        speed=speed,
-                        sv_emb=[sv_emb],
-                        overlap_frames=None,
-                        padding_length=0,
-                        result_length=current_tokens.shape[1]
-                    )
-                yield audio_chunk[0, 0].cpu().float().numpy()
+            h_samples = min(hist.shape[1] if hist is not None else 0, h_len) * samples_per_token
+            c_samples = tokens.shape[1] * samples_per_token
+            return audio[0, 0].cpu().float().numpy()[h_samples : h_samples + c_samples]
 
+        for chunk, is_last in token_generator:
+            if chunk is not None:
+                chunk_queue.append(chunk)
+            
+            # While we have at least one chunk to output and one for lookahead
+            while len(chunk_queue) > 1:
+                curr = chunk_queue.pop(0)
+                next_chunk = chunk_queue[0]
+                
+                audio_data = decode_and_crop(curr, history_tokens, next_chunk)
+                
+                # Crossfade
+                if prev_fade_out is not None:
+                    fade_in = np.linspace(0, 1, fade_len)
+                    audio_data[:fade_len] = audio_data[:fade_len] * fade_in + prev_fade_out * (1 - fade_in)
+                
+                prev_fade_out = audio_data[-fade_len:]
+                yield audio_data[:-fade_len]
+                history_tokens = curr
+
+            if is_last and chunk_queue:
+                # Handle the final chunk in queue
+                final_curr = chunk_queue.pop(0)
+                audio_data = decode_and_crop(final_curr, history_tokens, None)
+                
+                if prev_fade_out is not None:
+                    fade_in = np.linspace(0, 1, fade_len)
+                    audio_data[:fade_len] = audio_data[:fade_len] * fade_in + prev_fade_out * (1 - fade_in)
+                
+                yield audio_data
+
+        print("Streaming Inference Finished.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GPT-SoVITS Streaming Inference")
-    parser.add_argument("--gpt_path", required=True, help="Path to GPT model (.ckpt)")
-    parser.add_argument("--sovits_path", required=True, help="Path to SoVITS model (.pth)")
-    parser.add_argument("--cnhubert_base_path", default="pretrained_models/chinese-hubert-base",
-                        help="Path to CNHubert base")
-    parser.add_argument("--bert_path", default="pretrained_models/chinese-roberta-wwm-ext-large",
-                        help="Path to BERT model")
-    parser.add_argument("--ref_audio", required=True, help="Reference audio path")
-    parser.add_argument("--ref_text", required=True, help="Reference audio text")
-    parser.add_argument("--ref_lang", default="zh", help="Reference language (zh, en, ja, ko, yue)")
-    parser.add_argument("--text", required=True, help="Target text")
-    parser.add_argument("--lang", default="zh", help="Target language (zh, en, ja, ko, yue)")
-    parser.add_argument("--output", default="out_streaming.wav", help="Output filename")
-    parser.add_argument("--chunk_length", type=int, default=24, help="Semantic chunk length")
+    parser.add_argument("--gpt_path", required=True)
+    parser.add_argument("--sovits_path", required=True)
+    parser.add_argument("--cnhubert_base_path", default="pretrained_models/chinese-hubert-base")
+    parser.add_argument("--bert_path", default="pretrained_models/chinese-roberta-wwm-ext-large")
+    parser.add_argument("--ref_audio", required=True)
+    parser.add_argument("--ref_text", required=True)
+    parser.add_argument("--ref_lang", default="zh")
+    parser.add_argument("--text", required=True)
+    parser.add_argument("--lang", default="zh")
+    parser.add_argument("--output", default="out_streaming.wav")
+    parser.add_argument("--chunk_length", type=int, default=24)
 
     args = parser.parse_args()
-
-    inference = GPTSoVITSStreamingInference(
-        args.gpt_path,
-        args.sovits_path,
-        args.cnhubert_base_path,
-        args.bert_path
-    )
-
+    inference = GPTSoVITSStreamingInference(args.gpt_path, args.sovits_path, args.cnhubert_base_path, args.bert_path)
     full_audio = []
-    sr = inference.hps.data.sampling_rate
-    
-    for audio_chunk in inference.infer_stream(
-        args.ref_audio,
-        args.ref_text,
-        args.ref_lang,
-        args.text,
-        args.lang,
-        chunk_length=args.chunk_length
-    ):
+    for audio_chunk in inference.infer_stream(args.ref_audio, args.ref_text, args.ref_lang, args.text, args.lang, chunk_length=args.chunk_length):
         full_audio.append(audio_chunk)
-        # In a real streaming scenario, you would send audio_chunk to the client here.
         print(f"Yielded audio chunk: {len(audio_chunk)} samples")
-
     if full_audio:
-        combined_audio = np.concatenate(full_audio)
-        sf.write(args.output, combined_audio, sr)
-        print(f"Saved full streaming result to {args.output}")
+        sf.write(args.output, np.concatenate(full_audio), inference.hps.data.sampling_rate)
+        print(f"Saved to {args.output}")
