@@ -170,17 +170,23 @@ class GPTSoVITSStreamingInference:
             phones, word2ph, norm_text = clean_text(textlist[i], lang, version)
             phones = cleaned_text_to_sequence(phones, version)
             
-            with torch.no_grad():
-                inputs = self.tokenizer(norm_text, return_tensors="pt")
-                for k in inputs: inputs[k] = inputs[k].to(self.device)
-                res = self.bert_model(**inputs, output_hidden_states=True)
-                res = torch.cat(res["hidden_states"][-3:-2], -1)[0].cpu()[1:-1]
-            
-            phone_level_feature = []
-            for j in range(len(word2ph)):
-                phone_level_feature.append(res[j].repeat(word2ph[j], 1))
-            bert = torch.cat(phone_level_feature, dim=0).T
-            
+            if lang in ["zh", "yue"]:
+                with torch.no_grad():
+                    inputs = self.tokenizer(norm_text, return_tensors="pt")
+                    for k in inputs: inputs[k] = inputs[k].to(self.device)
+                    res = self.bert_model(**inputs, output_hidden_states=True)
+                    res = torch.cat(res["hidden_states"][-3:-2], -1)[0].cpu()[1:-1]
+                
+                phone_level_feature = []
+                for j in range(len(word2ph)):
+                    phone_level_feature.append(res[j].repeat(word2ph[j], 1))
+                bert = torch.cat(phone_level_feature, dim=0).T
+            else:
+                bert = torch.zeros(
+                    (1024, len(phones)),
+                    dtype=torch.float16 if self.is_half else torch.float32,
+                )
+
             phones_list.append(phones)
             bert_list.append(bert)
         
@@ -201,11 +207,11 @@ class GPTSoVITSStreamingInference:
     def infer_stream(self, ref_wav_path, prompt_text, prompt_lang, text, text_lang,
                     top_k=5, top_p=1, temperature=1, speed=1, chunk_length=24):
 
-        # 0. Load Mute Matrix
+        # Load Mute Matrix
         mute_matrix_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "GPT_SoVITS/pretrained_models/gpts1_mute_emb_sim_matrix.pt")
         mute_emb_sim_matrix = torch.load(mute_matrix_path, map_location=self.device) if os.path.exists(mute_matrix_path) else None
 
-        # 1. Process Reference
+        # Process Reference
         with torch.no_grad():
             wav16k, _ = librosa.load(ref_wav_path, sr=16000)
             wav16k = torch.from_numpy(wav16k).to(self.device)
@@ -216,20 +222,20 @@ class GPTSoVITSStreamingInference:
             prompt_semantic = self.vq_model.extract_latent(ssl_content)[0, 0]
             prompt = prompt_semantic.unsqueeze(0).to(self.device)
 
-        # 2. Process Text
+        # Process Text
         phones1, bert1 = self.get_phones_and_bert(prompt_text, prompt_lang, self.hps.model.version)
         phones2, bert2 = self.get_phones_and_bert(text, text_lang, self.hps.model.version)
         bert = torch.cat([bert1, bert2], 1).unsqueeze(0).to(self.device)
         all_phones = torch.LongTensor(phones1 + phones2).to(self.device).unsqueeze(0)
         all_phones_len = torch.tensor([all_phones.shape[-1]]).to(self.device)
 
-        # 3. SoVITS Preparations
+        # SoVITS Preparations
         refer_spec, refer_audio = self.get_spepc(ref_wav_path)
         if refer_audio.shape[0] > 1: refer_audio = refer_audio[0].unsqueeze(0)
         audio_16k = torchaudio.transforms.Resample(self.hps.data.sampling_rate, 16000).to(self.device)(refer_audio) if self.hps.data.sampling_rate != 16000 else refer_audio
         sv_emb = self.sv_model.compute_embedding3(audio_16k)
 
-        # 4. GPT Streaming Generator
+        # GPT Streaming Generator
         token_generator = self.t2s_model.model.infer_panel_naive(
             all_phones, all_phones_len, prompt, bert, top_k=top_k, top_p=top_p,
             temperature=temperature, early_stop_num=50 * 30, streaming_mode=True,
