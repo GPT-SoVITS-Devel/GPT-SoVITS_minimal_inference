@@ -804,6 +804,7 @@ class Text2SemanticDecoder(nn.Module):
         # print(idx_list)
         return y_list, idx_list
 
+    @torch.no_grad()
     def infer_panel_naive_batched(
         self,
         x: List[torch.LongTensor],  #####全部文本token
@@ -837,6 +838,7 @@ class Text2SemanticDecoder(nn.Module):
 
         return y_list, idx_list
 
+    @torch.no_grad()
     def infer_panel_naive(
         self,
         x: torch.LongTensor,  #####全部文本token
@@ -1045,6 +1047,7 @@ class Text2SemanticDecoder(nn.Module):
         
         return logits, k_cache, v_cache, x_len, y_len
 
+    @torch.no_grad()
     def infer_next_stage(
         self,
         samples: torch.Tensor, # (B, 1)
