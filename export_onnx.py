@@ -84,13 +84,13 @@ class SoVITS(nn.Module):
         self.vq_model = vq_model
         self.version = version
 
-    def forward(self, pred_semantic, text_seq, refer_spec, sv_emb=None):
+    def forward(self, pred_semantic, text_seq, refer_spec, sv_emb=None, noise_scale=0.5, speed=1.0):
         # Reconstruct list for decode
         refer_list = [refer_spec]
         sv_emb_list = [sv_emb] if sv_emb is not None else None
         
         return self.vq_model.decode(
-            pred_semantic, text_seq, refer_list, sv_emb=sv_emb_list
+            pred_semantic, text_seq, refer_list, sv_emb=sv_emb_list, noise_scale=noise_scale, speed=speed
         )
 
 class VQEncoder(nn.Module):
@@ -284,9 +284,20 @@ def export_onnx(args):
     text_seq = torch.randint(0, 512, (1, 50), dtype=torch.long)
     # refer_spec: [1, C, T_ref] -> [1, 1025, 200]
     refer_spec = torch.randn(1, 1025, 200)
+    noise_scale = torch.tensor([0.5], dtype=torch.float32)
+    speed = torch.tensor([1.0], dtype=torch.float32)
     
-    args_sovits = (pred_semantic, text_seq, refer_spec)
+    args_sovits = [pred_semantic, text_seq, refer_spec]
     input_names = ["pred_semantic", "text_seq", "refer_spec"]
+    
+    if "Pro" in model_version:
+        sv_emb = torch.randn(1, 20480)
+        args_sovits.append(sv_emb)
+        input_names.append("sv_emb")
+    
+    # Add noise_scale and speed at the end
+    args_sovits.extend([noise_scale, speed])
+    input_names.extend(["noise_scale", "speed"])
     
     dynamic_axes_sovits = {
         "pred_semantic": {2: "sem_len"},
@@ -294,14 +305,9 @@ def export_onnx(args):
         "refer_spec": {2: "ref_len"},
     }
     
-    if "Pro" in model_version:
-        sv_emb = torch.randn(1, 20480)
-        args_sovits += (sv_emb,)
-        input_names.append("sv_emb")
-    
     torch.onnx.export(
         sovits_wrapper,
-        args_sovits,
+        tuple(args_sovits),
         f"{output_dir}/sovits.onnx",
         input_names=input_names,
         output_names=["audio"],

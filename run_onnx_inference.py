@@ -28,6 +28,30 @@ from GPT_SoVITS.text.cleaner import clean_text
 from GPT_SoVITS.module.mel_processing import spectrogram_torch
 from GPT_SoVITS.sv import SV
 
+def split_text(text):
+    text = text.strip("\n")
+    if not text:
+        return []
+    sentence_delimiters = r'([。！？.!?…\n])'
+    parts = re.split(sentence_delimiters, text)
+    sentences = []
+    for i in range(0, len(parts) - 1, 2):
+        sentences.append(parts[i] + parts[i + 1])
+    if len(parts) % 2 == 1:
+        sentences.append(parts[-1])
+    sentences = [s.strip() for s in sentences if s.strip()]
+    merged = []
+    current = ""
+    for s in sentences:
+        if len(current) + len(s) < 20:
+            current += s
+        else:
+            if current:
+                merged.append(current)
+            current = s
+    if current:
+        merged.append(current)
+    return merged
 
 def sample_topk(topk_values, topk_indices, temperature=1.0):
     # topk_values: [B, K], topk_indices: [B, K]
@@ -175,6 +199,8 @@ class GPTSoVITS_ONNX_Inference:
                 "text_seq": dummy_seq,
                 "refer_spec": dummy_spec,
                 "sv_emb": dummy_emb,
+                "noise_scale": np.array([0.5], dtype=np.float32),
+                "speed": np.array([1.0], dtype=np.float32),
             })
 
         except Exception as e:
@@ -303,7 +329,7 @@ class GPTSoVITS_ONNX_Inference:
         return onnxruntime.OrtValue.ortvalue_from_numpy(data, "cuda", 0)
 
     def infer(self, ref_wav_path, prompt_text, prompt_lang, text, text_lang,
-              top_k=5, temperature=1.0, output_path="out.wav"):
+              top_k=5, temperature=1.0, noise_scale=0.5, speed=1.0, output_path="out.wav", pause_length=0.3):
 
         # Timers
         t_ref_audio = 0.0
@@ -329,118 +355,18 @@ class GPTSoVITS_ONNX_Inference:
         prompt_semantic = codes[0, 0][None, :]
         t_ref_audio = time.perf_counter() - t_start
 
-        # Text
-        t_start = time.perf_counter()
-        phones1, bert1, norm_text1 = self.get_phones_and_bert(prompt_text, prompt_lang, self.version)
-        phones2, bert2, norm_text2 = self.get_phones_and_bert(text, text_lang, self.version)
+        # Text segments
+        segments = split_text(text)
+        if not segments:
+            return
 
-        bert = np.concatenate([bert1, bert2], axis=1)[None, :, :].astype(self.precision)
+        final_audios = []
+        sr = self.hps["data"]["sampling_rate"]
 
-        all_phoneme_ids = np.array(phones1 + phones2, dtype=np.int64)[None, :]
-        all_phoneme_len = np.array([all_phoneme_ids.shape[1]], dtype=np.int64)
-        t_text_proc = time.perf_counter() - t_start
-
-        # GPT Encoder
-        print("Running GPT Encoder...")
-        t_start = time.perf_counter()
-        topk_values, topk_indices, k_cache, v_cache, x_len, y_len = self.run_sess(self.sess_gpt_enc, {
-            "phoneme_ids": all_phoneme_ids,
-            "phoneme_ids_len": all_phoneme_len,
-            "prompts": prompt_semantic.astype(np.int64),
-            "bert_feature": bert
-        })
-        t_gpt_enc = time.perf_counter() - t_start
-
-        current_samples = sample_topk(topk_values, topk_indices, temperature=temperature)
-        decoded_semantic_list = [prompt_semantic, current_samples]
-
-        # 4. GPT Step
-        print(f"Running GPT Step (Zero-Allocation Optimized)...")
-        t_dec_start = time.perf_counter()
-
-        max_steps = 1500
-        cache_dtype = np.float32
-        if self.step_inputs_info.get("k_cache", "").find("float16") != -1:
-            cache_dtype = np.float16
-
-        # Pre-allocate Ping-Pong caches to avoid allocation in loop
-        k_cache_ort_0 = self._to_gpu_ort(k_cache.astype(cache_dtype))
-        v_cache_ort_0 = self._to_gpu_ort(v_cache.astype(cache_dtype))
-        # Note: We need a second buffer because scatter is out-of-place in ONNX
-        k_cache_ort_1 = self._to_gpu_ort(k_cache.astype(cache_dtype))
-        v_cache_ort_1 = self._to_gpu_ort(v_cache.astype(cache_dtype))
-        
-        caches = [(k_cache_ort_0, v_cache_ort_0), (k_cache_ort_1, v_cache_ort_1)]
-
-        idx_ort_list = [onnxruntime.OrtValue.ortvalue_from_numpy(np.array([i], dtype=np.int64)) for i in range(max_steps)]
-
-        x_len_ort = onnxruntime.OrtValue.ortvalue_from_numpy(x_len.astype(np.int64))
-        y_len_ort = onnxruntime.OrtValue.ortvalue_from_numpy(y_len.astype(np.int64))
-
-        device_type_binding = "cuda" if self.device == "cuda" else "cpu"
-        device_id_binding = 0
-        
-        io_binding = self.step_io_binding
-
-        for i in range(max_steps):
-            # Input/Output Ping-Pong
-            src_cache = caches[i % 2]
-            dst_cache = caches[(i + 1) % 2]
-            
-            samples_ort = self._to_gpu_ort(current_samples.astype(np.int64))
-            # 从预分配列表中直接提取已就绪的 OrtValue
-            idx_ort = idx_ort_list[i]
-            
-            io_binding.bind_ortvalue_input("samples", samples_ort)
-            io_binding.bind_ortvalue_input("k_cache", src_cache[0])
-            io_binding.bind_ortvalue_input("v_cache", src_cache[1])
-            io_binding.bind_ortvalue_input("idx", idx_ort)
-            io_binding.bind_ortvalue_input("x_len", x_len_ort)
-            io_binding.bind_ortvalue_input("y_len", y_len_ort)
-
-            # Bind outputs - k_cache_new/v_cache_new bound to the OTHER buffer
-            io_binding.bind_output("topk_values", "cpu")
-            io_binding.bind_output("topk_indices", "cpu")
-            io_binding.bind_ortvalue_output("k_cache_new", dst_cache[0])
-            io_binding.bind_ortvalue_output("v_cache_new", dst_cache[1])
-
-            self.sess_gpt_step.run_with_iobinding(io_binding)
-
-            outputs = io_binding.get_outputs()
-            topk_values = outputs[0].numpy()
-            topk_indices = outputs[1].numpy()
-
-            # Sampling from Top-K (Much faster as transfer size is small)
-            current_samples = sample_topk(topk_values, topk_indices, temperature=temperature)
-            
-            decoded_semantic_list.append(current_samples)
-            steps += 1
-            if current_samples[0, 0] == 1024:
-                break
-
-        t_dec_end = time.perf_counter()
-        t_gpt_dec = t_dec_end - t_dec_start
-
-        pred_semantic = np.concatenate(decoded_semantic_list, axis=1)
-        generated_sem = pred_semantic[:, prompt_semantic.shape[1]:]
-        if generated_sem[0, -1] == 1024: generated_sem = generated_sem[:, :-1]
-        generated_sem = generated_sem[:, None, :]
-
-        # 5. SoVITS
-        print("Running SoVITS Decoder...")
-        t_start = time.perf_counter()
-
-        class AttrDict(dict):
-            def __init__(self, *args, **kwargs):
-                super(AttrDict, self).__init__(*args, **kwargs)
-                self.__dict__ = self
-
-        hps = AttrDict(self.hps)
-        if isinstance(hps.data, dict): hps.data = AttrDict(hps.data)
-
-        wav_ref, _ = librosa.load(ref_wav_path, sr=hps.data.sampling_rate)
-        spec = spectrogram_torch(torch.from_numpy(wav_ref)[None, :], hps.data.filter_length, hps.data.sampling_rate,
-                                 hps.data.hop_length, hps.data.win_length, center=False).numpy()
+        # 4. SoVITS Setup
+        wav_ref, _ = librosa.load(ref_wav_path, sr=sr)
+        spec = spectrogram_torch(torch.from_numpy(wav_ref)[None, :], self.hps["data"]["filter_length"], self.hps["data"]["sampling_rate"],
+                                 self.hps["data"]["hop_length"], self.hps["data"]["win_length"], center=False).numpy()
 
         wav16k_sv, _ = librosa.load(ref_wav_path, sr=16000)
         sv_emb = self.sv_model.compute_embedding3(torch.from_numpy(wav16k_sv)[None, :]).detach().cpu().numpy()
@@ -451,17 +377,103 @@ class GPTSoVITS_ONNX_Inference:
             tmp[:, :min(sv_emb.shape[-1], sv_size)] = sv_emb[:, :min(sv_emb.shape[-1], sv_size)]
             sv_emb = tmp
 
-        audio = self.run_sess(self.sess_sovits, {
-            "pred_semantic": generated_sem.astype(np.int64),
-            "text_seq": np.array(phones2, dtype=np.int64)[None, :],
-            "refer_spec": spec.astype(self.precision),
-            "sv_emb": sv_emb.astype(self.precision),
-        })[0]
+        # 2. Process Reference Text (Once)
+        t_start = time.perf_counter()
+        phones1, bert1, norm_text1 = self.get_phones_and_bert(prompt_text, prompt_lang, self.version)
+        t_text_proc += time.perf_counter() - t_start
 
-        t_sovits = time.perf_counter() - t_start
+        for seg_idx, seg in enumerate(segments):
+            print(f"Processing segment {seg_idx+1}/{len(segments)}: {seg}")
+            t_start = time.perf_counter()
+            phones2, bert2, norm_text2 = self.get_phones_and_bert(seg, text_lang, self.version)
+
+            bert = np.concatenate([bert1, bert2], axis=1)[None, :, :].astype(self.precision)
+
+            all_phoneme_ids = np.array(phones1 + phones2, dtype=np.int64)[None, :]
+            all_phoneme_len = np.array([all_phoneme_ids.shape[1]], dtype=np.int64)
+            t_text_proc += time.perf_counter() - t_start
+
+            # GPT Encoder
+            t_start = time.perf_counter()
+            topk_values, topk_indices, k_cache, v_cache, x_len, y_len = self.run_sess(self.sess_gpt_enc, {
+                "phoneme_ids": all_phoneme_ids,
+                "phoneme_ids_len": all_phoneme_len,
+                "prompts": prompt_semantic.astype(np.int64),
+                "bert_feature": bert
+            })
+            t_gpt_enc += time.perf_counter() - t_start
+
+            current_samples = sample_topk(topk_values, topk_indices, temperature=temperature)
+            decoded_semantic_list = [prompt_semantic, current_samples]
+
+            # 4. GPT Step
+            t_dec_start = time.perf_counter()
+            max_steps = 1500
+            cache_dtype = np.float32
+            if self.step_inputs_info.get("k_cache", "").find("float16") != -1:
+                cache_dtype = np.float16
+
+            k_cache_ort_0 = self._to_gpu_ort(k_cache.astype(cache_dtype))
+            v_cache_ort_0 = self._to_gpu_ort(v_cache.astype(cache_dtype))
+            k_cache_ort_1 = self._to_gpu_ort(k_cache.astype(cache_dtype))
+            v_cache_ort_1 = self._to_gpu_ort(v_cache.astype(cache_dtype))
+            caches = [(k_cache_ort_0, v_cache_ort_0), (k_cache_ort_1, v_cache_ort_1)]
+            idx_ort_list = [onnxruntime.OrtValue.ortvalue_from_numpy(np.array([i], dtype=np.int64)) for i in range(max_steps)]
+            x_len_ort = onnxruntime.OrtValue.ortvalue_from_numpy(x_len.astype(np.int64))
+            y_len_ort = onnxruntime.OrtValue.ortvalue_from_numpy(y_len.astype(np.int64))
+            io_binding = self.step_io_binding
+
+            for i in range(max_steps):
+                src_cache = caches[i % 2]
+                dst_cache = caches[(i + 1) % 2]
+                samples_ort = self._to_gpu_ort(current_samples.astype(np.int64))
+                idx_ort = idx_ort_list[i]
+                io_binding.bind_ortvalue_input("samples", samples_ort)
+                io_binding.bind_ortvalue_input("k_cache", src_cache[0])
+                io_binding.bind_ortvalue_input("v_cache", src_cache[1])
+                io_binding.bind_ortvalue_input("idx", idx_ort)
+                io_binding.bind_ortvalue_input("x_len", x_len_ort)
+                io_binding.bind_ortvalue_input("y_len", y_len_ort)
+                io_binding.bind_output("topk_values", "cpu")
+                io_binding.bind_output("topk_indices", "cpu")
+                io_binding.bind_ortvalue_output("k_cache_new", dst_cache[0])
+                io_binding.bind_ortvalue_output("v_cache_new", dst_cache[1])
+                self.sess_gpt_step.run_with_iobinding(io_binding)
+                outputs = io_binding.get_outputs()
+                topk_values = outputs[0].numpy()
+                topk_indices = outputs[1].numpy()
+                current_samples = sample_topk(topk_values, topk_indices, temperature=temperature)
+                decoded_semantic_list.append(current_samples)
+                steps += 1
+                if current_samples[0, 0] == 1024:
+                    break
+            t_gpt_dec += time.perf_counter() - t_dec_start
+
+            pred_semantic = np.concatenate(decoded_semantic_list, axis=1)
+            generated_sem = pred_semantic[:, prompt_semantic.shape[1]:]
+            if generated_sem[0, -1] == 1024: generated_sem = generated_sem[:, :-1]
+            generated_sem = generated_sem[:, None, :]
+
+            # 5. SoVITS
+            t_start = time.perf_counter()
+            audio = self.run_sess(self.sess_sovits, {
+                "pred_semantic": generated_sem.astype(np.int64),
+                "text_seq": np.array(phones2, dtype=np.int64)[None, :],
+                "refer_spec": spec.astype(self.precision),
+                "sv_emb": sv_emb.astype(self.precision),
+                "noise_scale": np.array([noise_scale], dtype=np.float32),
+                "speed": np.array([speed], dtype=np.float32),
+            })[0]
+            t_sovits += time.perf_counter() - t_start
+            
+            final_audios.append(audio.squeeze())
+            if seg_idx < len(segments) - 1 and pause_length > 0:
+                final_audios.append(np.zeros(int(sr * pause_length)))
+
         t_total = time.perf_counter() - t_total_start
-
-        sf.write(output_path, audio.squeeze().astype(np.float32), hps.data.sampling_rate)
+        
+        full_audio = np.concatenate(final_audios).astype(np.float32)
+        sf.write(output_path, full_audio, sr)
         print(f"write {output_path}")
         # Report
         t_step_avg = t_gpt_dec / steps if steps > 0 else 0.0
@@ -487,11 +499,13 @@ if __name__ == "__main__":
     parser.add_argument("--ref_lang", default="zh")
     parser.add_argument("--lang", default="zh")
     parser.add_argument("--bert_path", default="pretrained_models/chinese-roberta-wwm-ext-large")
+    parser.add_argument("--pause_length", type=float, default=0.3)
     args = parser.parse_args()
 
     GPTSoVITS_ONNX_Inference(
         args.onnx_dir, args.bert_path, args.sovits_path,
         device="cuda" if torch.cuda.is_available() else "cpu"
     ).infer(
-        args.ref_audio, args.ref_text, args.ref_lang, args.text, args.lang, output_path=args.output
+        args.ref_audio, args.ref_text, args.ref_lang, args.text, args.lang, 
+        output_path=args.output, pause_length=args.pause_length
     )

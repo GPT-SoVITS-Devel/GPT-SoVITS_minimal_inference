@@ -62,6 +62,32 @@ class DictToAttrRecursive(dict):
             raise AttributeError(f"Attribute {item} not found")
 
 
+def split_text(text):
+    text = text.strip("\n")
+    if not text:
+        return []
+    sentence_delimiters = r'([。！？.!?…\n])'
+    parts = re.split(sentence_delimiters, text)
+    sentences = []
+    for i in range(0, len(parts) - 1, 2):
+        sentences.append(parts[i] + parts[i + 1])
+    if len(parts) % 2 == 1:
+        sentences.append(parts[-1])
+    sentences = [s.strip() for s in sentences if s.strip()]
+    merged = []
+    current = ""
+    for s in sentences:
+        if len(current) + len(s) < 20:
+            current += s
+        else:
+            if current:
+                merged.append(current)
+            current = s
+    if current:
+        merged.append(current)
+    return merged
+
+
 class GPTSoVITSInference:
     def __init__(self, gpt_path, sovits_path, cnhubert_base_path, bert_path):
         self.device = device
@@ -247,18 +273,25 @@ class GPTSoVITSInference:
         return spec, audio
 
     def infer(self, ref_wav_path, prompt_text, prompt_lang, text, text_lang,
-              top_k=5, top_p=1, temperature=1, speed=1):
+              top_k=5, top_p=1, temperature=1, speed=1, pause_length=0.3):
 
         print(f"Inferencing: {text} ({text_lang})")
+        
+        segments = split_text(text)
+        if not segments:
+            return np.zeros(0), self.hps.data.sampling_rate
+            
+        final_audios = []
+        sr = self.hps.data.sampling_rate
 
-        # 1. Process Reference
+        # Process Reference
         zero_wav = torch.zeros(
             int(self.hps.data.sampling_rate * 0.3),
             dtype=torch.float16 if self.is_half else torch.float32
         ).to(self.device)
 
         with torch.no_grad():
-            wav16k, sr = librosa.load(ref_wav_path, sr=16000)
+            wav16k, _ = librosa.load(ref_wav_path, sr=16000)
             wav16k = torch.from_numpy(wav16k).to(self.device)
             if self.is_half: wav16k = wav16k.half()
 
@@ -269,54 +302,55 @@ class GPTSoVITSInference:
             prompt_semantic = codes[0, 0]
             prompt = prompt_semantic.unsqueeze(0).to(self.device)
 
-        # 2. Process Text
+            # SoVITS Inference Setup
+            refer_spec, refer_audio = self.get_spepc(ref_wav_path)
+            if refer_audio.shape[0] > 1: refer_audio = refer_audio[0].unsqueeze(0)
+            if self.hps.data.sampling_rate != 16000:
+                audio_16k = torchaudio.transforms.Resample(self.hps.data.sampling_rate, 16000).to(self.device)(refer_audio)
+            else:
+                audio_16k = refer_audio
+            sv_emb = self.sv_model.compute_embedding3(audio_16k)
+
+        # Process Reference Text (Once)
         phones1, bert1, norm_text1 = self.get_phones_and_bert(prompt_text, prompt_lang, self.hps.model.version)
-        phones2, bert2, norm_text2 = self.get_phones_and_bert(text, text_lang, self.hps.model.version)
 
-        bert = torch.cat([bert1, bert2], 1).unsqueeze(0).to(self.device)
-        all_phoneme_ids = torch.LongTensor(phones1 + phones2).to(self.device).unsqueeze(0)
-        all_phoneme_len = torch.tensor([all_phoneme_ids.shape[-1]]).to(self.device)
+        for i, seg in enumerate(segments):
+            print(f"Processing segment {i+1}/{len(segments)}: {seg}")
+            # 2. Process Text Segment
+            phones2, bert2, norm_text2 = self.get_phones_and_bert(seg, text_lang, self.hps.model.version)
 
-        # 3. GPT Inference
-        with torch.no_grad():
-            pred_semantic, idx = self.t2s_model.model.infer_panel(
-                all_phoneme_ids,
-                all_phoneme_len,
-                prompt,
-                bert,
-                top_k=top_k,
-                top_p=top_p,
-                temperature=temperature,
-                early_stop_num=50 * 30  # max_sec
-            )
-            pred_semantic = pred_semantic[:, -idx:].unsqueeze(0)
+            bert = torch.cat([bert1, bert2], 1).unsqueeze(0).to(self.device)
+            all_phoneme_ids = torch.LongTensor(phones1 + phones2).to(self.device).unsqueeze(0)
+            all_phoneme_len = torch.tensor([all_phoneme_ids.shape[-1]]).to(self.device)
 
-        # 4. SoVITS Inference
-        refer_spec, refer_audio = self.get_spepc(ref_wav_path)
+            # GPT Inference
+            with torch.no_grad():
+                pred_semantic, idx = self.t2s_model.model.infer_panel(
+                    all_phoneme_ids,
+                    all_phoneme_len,
+                    prompt,
+                    bert,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                    early_stop_num=50 * 30  # max_sec
+                )
+                pred_semantic = pred_semantic[:, -idx:].unsqueeze(0)
 
-        # SV Embedding (v2Pro)
-        # We need 16k audio for SV
-        if refer_audio.shape[0] > 1: refer_audio = refer_audio[0].unsqueeze(0)
+                # Standard V2/V2Pro decoding
+                audio = self.vq_model.decode(
+                    pred_semantic,
+                    torch.LongTensor(phones2).to(self.device).unsqueeze(0),
+                    [refer_spec],  # List of refers
+                    speed=speed,
+                    sv_emb=[sv_emb]  # List of sv_embs
+                )[0][0]
+                
+                final_audios.append(audio.cpu().float().numpy())
+                if i < len(segments) - 1 and pause_length > 0:
+                    final_audios.append(np.zeros(int(sr * pause_length)))
 
-        # Resample for SV (16k)
-        if self.hps.data.sampling_rate != 16000:
-            audio_16k = torchaudio.transforms.Resample(self.hps.data.sampling_rate, 16000).to(self.device)(refer_audio)
-        else:
-            audio_16k = refer_audio
-
-        sv_emb = self.sv_model.compute_embedding3(audio_16k)
-
-        with torch.no_grad():
-            # Standard V2/V2Pro decoding
-            audio = self.vq_model.decode(
-                pred_semantic,
-                torch.LongTensor(phones2).to(self.device).unsqueeze(0),
-                [refer_spec],  # List of refers
-                speed=speed,
-                sv_emb=[sv_emb]  # List of sv_embs
-            )[0][0]
-
-        return audio.cpu().float().numpy(), self.hps.data.sampling_rate
+        return np.concatenate(final_audios), sr
 
 
 if __name__ == "__main__":
@@ -333,6 +367,7 @@ if __name__ == "__main__":
     parser.add_argument("--text", required=True, help="Target text")
     parser.add_argument("--lang", default="zh", help="Target language (zh, en, ja, ko, yue)")
     parser.add_argument("--output", default="output.wav", help="Output filename")
+    parser.add_argument("--pause_length", type=float, default=0.3, help="Pause length between sentences (seconds)")
 
     args = parser.parse_args()
 
@@ -348,7 +383,8 @@ if __name__ == "__main__":
         args.ref_text,
         args.ref_lang,
         args.text,
-        args.lang
+        args.lang,
+        pause_length=args.pause_length
     )
 
     import soundfile as sf

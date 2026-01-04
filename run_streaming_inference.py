@@ -7,6 +7,7 @@ import argparse
 import warnings
 import torchaudio
 import soundfile as sf
+import time
 from tqdm import tqdm
 
 # Filter warnings
@@ -29,8 +30,30 @@ from GPT_SoVITS.process_ckpt import load_sovits_new, get_sovits_version_from_pat
 from GPT_SoVITS.sv import SV
 from GPT_SoVITS.utils import load_audio_equivalent
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-is_half = True if device == "cuda" else False
+def split_text(text):
+    text = text.strip("\n")
+    if not text:
+        return []
+    sentence_delimiters = r'([。！？.!?…\n])'
+    parts = re.split(sentence_delimiters, text)
+    sentences = []
+    for i in range(0, len(parts) - 1, 2):
+        sentences.append(parts[i] + parts[i + 1])
+    if len(parts) % 2 == 1:
+        sentences.append(parts[-1])
+    sentences = [s.strip() for s in sentences if s.strip()]
+    merged = []
+    current = ""
+    for s in sentences:
+        if len(current) + len(s) < 20:
+            current += s
+        else:
+            if current:
+                merged.append(current)
+            current = s
+    if current:
+        merged.append(current)
+    return merged
 
 
 class DictToAttrRecursive(dict):
@@ -205,7 +228,7 @@ class GPTSoVITSStreamingInference:
         return spec, audio
 
     def infer_stream(self, ref_wav_path, prompt_text, prompt_lang, text, text_lang,
-                    top_k=5, top_p=1, temperature=1, speed=1, chunk_length=24):
+                    top_k=15, top_p=1, temperature=1, speed=1, chunk_length=24, noise_scale=0.35, pause_length=0.3):
 
         # Load Mute Matrix
         mute_matrix_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "GPT_SoVITS/pretrained_models/gpts1_mute_emb_sim_matrix.pt")
@@ -222,80 +245,105 @@ class GPTSoVITSStreamingInference:
             prompt_semantic = self.vq_model.extract_latent(ssl_content)[0, 0]
             prompt = prompt_semantic.unsqueeze(0).to(self.device)
 
-            # Process Text
+            # Process Reference Text (Once)
             phones1, bert1 = self.get_phones_and_bert(prompt_text, prompt_lang, self.hps.model.version)
-            phones2, bert2 = self.get_phones_and_bert(text, text_lang, self.hps.model.version)
-            bert = torch.cat([bert1, bert2], 1).unsqueeze(0).to(self.device)
-            all_phones = torch.LongTensor(phones1 + phones2).to(self.device).unsqueeze(0)
-            all_phones_len = torch.tensor([all_phones.shape[-1]]).to(self.device)
-
+            
             # SoVITS Preparations
             refer_spec, refer_audio = self.get_spepc(ref_wav_path)
             if refer_audio.shape[0] > 1: refer_audio = refer_audio[0].unsqueeze(0)
             audio_16k = torchaudio.transforms.Resample(self.hps.data.sampling_rate, 16000).to(self.device)(refer_audio) if self.hps.data.sampling_rate != 16000 else refer_audio
             sv_emb = self.sv_model.compute_embedding3(audio_16k)
 
-            # GPT Streaming Generator
-            token_generator = self.t2s_model.model.infer_panel_naive(
-                all_phones, all_phones_len, prompt, bert, top_k=top_k, top_p=top_p,
-                temperature=temperature, early_stop_num=50 * 30, streaming_mode=True,
-                chunk_length=chunk_length, mute_emb_sim_matrix=mute_emb_sim_matrix
-            )
-
-            phones2_tensor = torch.LongTensor(phones2).to(self.device).unsqueeze(0)
+            segments = split_text(text)
             sr = self.hps.data.sampling_rate
             samples_per_token = sr // 25
-            h_len, l_len, fade_len = 16, 16, 160
-            history_tokens, prev_fade_out = None, None
-            
-            # Buffer queue for lookahead
-            chunk_queue = []
+            h_len, l_len, fade_len = 512, 16, 1280
+            prev_fade_out = None
 
-            def decode_and_crop(tokens, hist, lookahead):
-                input_list = []
-                if hist is not None: input_list.append(hist[:, -h_len:])
-                input_list.append(tokens)
-                if lookahead is not None: input_list.append(lookahead[:, :l_len])
-                
-                full_chunk = torch.cat(input_list, dim=1)
-                # We use manual cropping because our models.py modification 
-                # handles context-aware Transformer encoding perfectly.
-                audio = self.vq_model.decode(full_chunk.unsqueeze(0), phones2_tensor, [refer_spec], noise_scale=0, speed=speed, sv_emb=[sv_emb])
-                
-                h_samples = min(hist.shape[1] if hist is not None else 0, h_len) * samples_per_token
-                c_samples = tokens.shape[1] * samples_per_token
-                return audio[0, 0].cpu().float().numpy()[h_samples : h_samples + c_samples]
+            for seg_idx, seg_text in enumerate(segments):
+                print(f"Processing segment {seg_idx+1}/{len(segments)}: {seg_text}")
+                # Process Text Segment
+                phones2, bert2 = self.get_phones_and_bert(seg_text, text_lang, self.hps.model.version)
+                bert = torch.cat([bert1, bert2], 1).unsqueeze(0).to(self.device)
+                all_phones = torch.LongTensor(phones1 + phones2).to(self.device).unsqueeze(0)
+                all_phones_len = torch.tensor([all_phones.shape[-1]]).to(self.device)
 
-            for chunk, is_last in token_generator:
-                if chunk is not None:
-                    chunk_queue.append(chunk)
-                
-                # While we have at least one chunk to output and one for lookahead
-                while len(chunk_queue) > 1:
-                    curr = chunk_queue.pop(0)
-                    next_chunk = chunk_queue[0]
-                    
-                    audio_data = decode_and_crop(curr, history_tokens, next_chunk)
-                    
-                    # Crossfade
-                    if prev_fade_out is not None:
-                        fade_in = np.linspace(0, 1, fade_len)
-                        audio_data[:fade_len] = audio_data[:fade_len] * fade_in + prev_fade_out * (1 - fade_in)
-                    
-                    prev_fade_out = audio_data[-fade_len:]
-                    yield audio_data[:-fade_len]
-                    history_tokens = curr
+                # GPT Streaming Generator
+                token_generator = self.t2s_model.model.infer_panel_naive(
+                    all_phones, all_phones_len, prompt, bert, top_k=top_k, top_p=top_p,
+                    temperature=temperature, early_stop_num=50 * 30, streaming_mode=True,
+                    chunk_length=chunk_length, mute_emb_sim_matrix=mute_emb_sim_matrix
+                )
 
-                if is_last and chunk_queue:
-                    # Handle the final chunk in queue
-                    final_curr = chunk_queue.pop(0)
-                    audio_data = decode_and_crop(final_curr, history_tokens, None)
+                phones2_tensor = torch.LongTensor(phones2).to(self.device).unsqueeze(0)
+                history_tokens = None
+                
+                # Buffer queue for lookahead
+                chunk_queue = []
+
+                def decode_and_crop(tokens, hist, lookahead):
+                    input_list = []
+                    h_chunk = None
+                    if hist is not None: 
+                        h_chunk = hist[:, -h_len:]
+                        input_list.append(h_chunk)
+                    input_list.append(tokens)
+                    l_chunk = None
+                    if lookahead is not None: 
+                        l_chunk = lookahead[:, :l_len]
+                        input_list.append(l_chunk)
                     
-                    if prev_fade_out is not None:
-                        fade_in = np.linspace(0, 1, fade_len)
-                        audio_data[:fade_len] = audio_data[:fade_len] * fade_in + prev_fade_out * (1 - fade_in)
+                    full_chunk = torch.cat(input_list, dim=1)
+                    audio = self.vq_model.decode(full_chunk.unsqueeze(0), phones2_tensor, [refer_spec], noise_scale=noise_scale, speed=speed, sv_emb=[sv_emb])
                     
-                    yield audio_data
+                    # Actual samples per token depends on speed
+                    actual_samples_per_token = samples_per_token / speed
+                    h_samples = int(h_chunk.shape[1] * actual_samples_per_token) if h_chunk is not None else 0
+                    c_samples = int(tokens.shape[1] * actual_samples_per_token)
+                    return audio[0, 0].cpu().float().numpy()[h_samples : h_samples + c_samples]
+
+                for chunk, is_last in token_generator:
+                    if chunk is not None:
+                        chunk_queue.append(chunk)
+                    
+                    # While we have at least one chunk to output and one for lookahead
+                    while len(chunk_queue) > 1:
+                        curr = chunk_queue.pop(0)
+                        next_chunk = chunk_queue[0]
+                        
+                        audio_data = decode_and_crop(curr, history_tokens, next_chunk)
+                        
+                        # Crossfade
+                        if prev_fade_out is not None:
+                            fade_in = np.linspace(0, 1, fade_len)
+                            audio_data[:fade_len] = audio_data[:fade_len] * fade_in + prev_fade_out * (1 - fade_in)
+                        
+                        prev_fade_out = audio_data[-fade_len:]
+                        yield audio_data[:-fade_len]
+                        if history_tokens is None:
+                            history_tokens = curr
+                        else:
+                            history_tokens = torch.cat([history_tokens, curr], dim=1)
+                            if history_tokens.shape[1] > h_len:
+                                history_tokens = history_tokens[:, -h_len:]
+
+                    if is_last and chunk_queue:
+                        # Handle the final chunk in queue
+                        final_curr = chunk_queue.pop(0)
+                        audio_data = decode_and_crop(final_curr, history_tokens, None)
+                        
+                        if prev_fade_out is not None:
+                            fade_in = np.linspace(0, 1, fade_len)
+                            audio_data[:fade_len] = audio_data[:fade_len] * fade_in + prev_fade_out * (1 - fade_in)
+                        
+                        if seg_idx < len(segments) - 1:
+                            # Flush fade_out and add pause
+                            yield audio_data
+                            prev_fade_out = None
+                            if pause_length > 0:
+                                yield np.zeros(int(sr * pause_length), dtype=np.float32)
+                        else:
+                            yield audio_data
 
         print("Streaming Inference Finished.")
 
@@ -303,18 +351,26 @@ def launch_webui(args):
     import gradio as gr
     inference = GPTSoVITSStreamingInference(args.gpt_path, args.sovits_path, args.cnhubert_base_path, args.bert_path)
     
-    def predict(ref_audio, ref_text, ref_lang, text, lang, top_k, top_p, temperature, speed, chunk_length):
+    def predict(ref_audio, ref_text, ref_lang, text, lang, top_k, top_p, temperature, speed, chunk_length, noise_scale, pause_length):
         if ref_audio is None or not text:
-            return None
+            return
         
+        start_time = time.time()
         gen = inference.infer_stream(
             ref_audio, ref_text, ref_lang, text, lang,
             top_k=top_k, top_p=top_p, temperature=temperature, 
-            speed=speed, chunk_length=chunk_length
+            speed=speed, chunk_length=chunk_length, noise_scale=noise_scale,
+            pause_length=pause_length
         )
         
+        latency = None
+        sr = inference.hps.data.sampling_rate
         for audio_chunk in gen:
-            yield (inference.hps.data.sampling_rate, (audio_chunk * 32768).astype(np.int16))
+            if latency is None:
+                latency = time.time() - start_time
+                yield (sr, (audio_chunk * 32768).astype(np.int16)), f"{latency:.3f}s"
+            else:
+                yield (sr, (audio_chunk * 32768).astype(np.int16)), f"{latency:.3f}s"
 
     with gr.Blocks(title="GPT-SoVITS Streaming Inference") as app:
         gr.Markdown("# GPT-SoVITS Streaming Inference")
@@ -327,21 +383,24 @@ def launch_webui(args):
                 target_lang = gr.Dropdown(label="Target Language", choices=["zh", "en", "ja", "ko", "yue", "auto", "auto_yue"], value=args.lang)
                 
                 with gr.Accordion("Advanced Settings", open=False):
-                    top_k = gr.Slider(label="Top K", minimum=1, maximum=100, step=1, value=5)
+                    top_k = gr.Slider(label="Top K", minimum=1, maximum=100, step=1, value=15)
                     top_p = gr.Slider(label="Top P", minimum=0.1, maximum=1.0, step=0.05, value=1.0)
                     temperature = gr.Slider(label="Temperature", minimum=0.1, maximum=2.0, step=0.05, value=1.0)
                     speed = gr.Slider(label="Speed", minimum=0.5, maximum=2.0, step=0.1, value=1.0)
+                    noise_scale = gr.Slider(label="Noise Scale", minimum=0.0, maximum=1.0, step=0.05, value=0.35)
                     chunk_length = gr.Slider(label="Chunk Length", minimum=10, maximum=100, step=1, value=24)
+                    pause_length = gr.Slider(label="Pause Length", minimum=0.0, maximum=1.0, step=0.05, value=0.3)
                 
                 btn = gr.Button("Generate", variant="primary")
             
             with gr.Column():
                 audio_output = gr.Audio(label="Output Audio", streaming=True, autoplay=True)
+                latency_label = gr.Textbox(label="首包延迟 (First Packet Latency)", interactive=False)
 
         btn.click(
             predict,
-            inputs=[ref_audio, ref_text, ref_lang, target_text, target_lang, top_k, top_p, temperature, speed, chunk_length],
-            outputs=[audio_output]
+            inputs=[ref_audio, ref_text, ref_lang, target_text, target_lang, top_k, top_p, temperature, speed, chunk_length, noise_scale, pause_length],
+            outputs=[audio_output, latency_label]
         )
 
     app.queue().launch(server_name=args.host, server_port=args.port, share=args.share)
@@ -359,6 +418,8 @@ if __name__ == "__main__":
     parser.add_argument("--lang", default="zh")
     parser.add_argument("--output", default="out_streaming.wav")
     parser.add_argument("--chunk_length", type=int, default=24)
+    parser.add_argument("--noise_scale", type=float, default=0.35)
+    parser.add_argument("--pause_length", type=float, default=0.3)
 
     # WebUI arguments
     parser.add_argument("--webui", action="store_true", help="Launch WebUI")
@@ -375,7 +436,7 @@ if __name__ == "__main__":
             parser.error("--ref_audio and --text are required in CLI mode")
         inference = GPTSoVITSStreamingInference(args.gpt_path, args.sovits_path, args.cnhubert_base_path, args.bert_path)
         full_audio = []
-        for audio_chunk in inference.infer_stream(args.ref_audio, args.ref_text, args.ref_lang, args.text, args.lang, chunk_length=args.chunk_length):
+        for audio_chunk in inference.infer_stream(args.ref_audio, args.ref_text, args.ref_lang, args.text, args.lang, chunk_length=args.chunk_length, noise_scale=args.noise_scale, pause_length=args.pause_length):
             full_audio.append(audio_chunk)
             print(f"Yielded audio chunk: {len(audio_chunk)} samples")
         if full_audio:

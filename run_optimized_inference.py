@@ -63,7 +63,6 @@ def split_text(text):
         return []
     
     # Split by common sentence endings and keep them
-    # Use multiple punctuation marks as delimiters
     sentence_delimiters = r'([。！？.!?…\n])'
     parts = re.split(sentence_delimiters, text)
     
@@ -76,11 +75,11 @@ def split_text(text):
     
     sentences = [s.strip() for s in sentences if s.strip()]
     
-    # Merge short sentences
+    # Merge very short segments to avoid artifacts
     merged = []
     current = ""
     for s in sentences:
-        if len(current) + len(s) < 20: # Minimum segment length (increased slightly)
+        if len(current) + len(s) < 10: 
             current += s
         else:
             if current:
@@ -92,7 +91,7 @@ def split_text(text):
     return merged
 
 
-class GPTSoVITSLongInference:
+class GPTSoVITSOptimizedInference:
     def __init__(self, gpt_path, sovits_path, cnhubert_base_path, bert_path):
         self.device = device
         self.is_half = is_half
@@ -241,15 +240,20 @@ class GPTSoVITSLongInference:
         if self.is_half: spec = spec.half()
         return spec, audio
 
-    def infer_long(self, ref_wav_path, prompt_text, prompt_lang, text, text_lang,
-                   top_k=15, top_p=1, temperature=1, speed=1, chunk_length=24, noise_scale=0.35, pause_length=0.3):
-
-        # Load Mute Matrix
+    def infer_optimized(self, ref_wav_path, prompt_text, prompt_lang, text, text_lang,
+                        top_k=15, top_p=1, temperature=1, speed=1, chunk_length=24, noise_scale=0.35,
+                        history_window=4, pause_length=0.3):
+        """
+        Optimized inference:
+        1. First sentence uses streaming for low latency.
+        2. Subsequent sentences use previously generated tokens as context (long-context).
+        3. Sliding window for history to maintain performance.
+        """
         mute_matrix_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "GPT_SoVITS/pretrained_models/gpts1_mute_emb_sim_matrix.pt")
         mute_emb_sim_matrix = torch.load(mute_matrix_path, map_location=self.device) if os.path.exists(mute_matrix_path) else None
 
         with torch.no_grad():
-            # Process Reference
+            # Process Reference Audio (Once)
             wav16k, _ = librosa.load(ref_wav_path, sr=16000)
             wav16k = torch.from_numpy(wav16k).to(self.device)
             if self.is_half: wav16k = wav16k.half()
@@ -259,49 +263,53 @@ class GPTSoVITSLongInference:
             prompt_semantic = self.vq_model.extract_latent(ssl_content)[0, 0]
             ref_tokens = prompt_semantic.unsqueeze(0).to(self.device)
 
-            # Process Reference Text
             ref_phones, ref_bert = self.get_phones_and_bert(prompt_text, prompt_lang, self.hps.model.version)
 
-            # SoVITS Preparations
             refer_spec, refer_audio = self.get_spepc(ref_wav_path)
             if refer_audio.shape[0] > 1: refer_audio = refer_audio[0].unsqueeze(0)
             audio_16k = torchaudio.transforms.Resample(self.hps.data.sampling_rate, 16000).to(self.device)(refer_audio) if self.hps.data.sampling_rate != 16000 else refer_audio
             sv_emb = self.sv_model.compute_embedding3(audio_16k)
 
-            # Split long text
+            # Split Target Text
             segments = split_text(text)
-            print(f"Total segments: {len(segments)}")
+            if not segments: return
 
-            # Initialize History
-            # We start with the original reference
-            history_phones = ref_phones
-            history_bert = ref_bert
-            history_tokens = ref_tokens
+            # History Management
+            # sliding_history stores list of (phones, bert, tokens) for each segment in the window
+            sliding_history = [] 
 
             sr = self.hps.data.sampling_rate
             samples_per_token = sr // 25
-            h_len, l_len, fade_len = 16, 16, 160
+            # Crossfade params
+            h_len, l_len, fade_len = 16, 16, 640 # Reduced fade_len for lower latency
             prev_fade_out = None
 
             for i, seg_text in enumerate(segments):
-                print(f"Processing segment {i+1}/{len(segments)}: {seg_text[:30]}...")
-                
                 # Process Current Segment Text
                 curr_phones, curr_bert = self.get_phones_and_bert(seg_text, text_lang, self.hps.model.version)
                 
-                # Prepare GPT Input
-                if i == 0:
+                # Construct Input with History
+                hist_phones_list = []
+                hist_bert_list = []
+                hist_tokens_list = []
+                
+                for hp, hb, ht in sliding_history:
+                    hist_phones_list += hp
+                    hist_bert_list.append(hb)
+                    hist_tokens_list.append(ht)
+                
+                if not sliding_history:
                     inp_phones = torch.LongTensor(ref_phones + curr_phones).to(self.device).unsqueeze(0)
                     inp_bert = torch.cat([ref_bert, curr_bert], 1).unsqueeze(0).to(self.device)
                     inp_prompt = ref_tokens
                 else:
-                    inp_phones = torch.LongTensor(ref_phones + history_phones + curr_phones).to(self.device).unsqueeze(0)
-                    inp_bert = torch.cat([ref_bert, history_bert, curr_bert], 1).unsqueeze(0).to(self.device)
-                    inp_prompt = torch.cat([ref_tokens, history_tokens], 1)
-                
+                    inp_phones = torch.LongTensor(ref_phones + hist_phones_list + curr_phones).to(self.device).unsqueeze(0)
+                    inp_bert = torch.cat([ref_bert] + hist_bert_list + [curr_bert], 1).unsqueeze(0).to(self.device)
+                    inp_prompt = torch.cat([ref_tokens] + hist_tokens_list, 1)
+
                 inp_phones_len = torch.tensor([inp_phones.shape[-1]]).to(self.device)
 
-                # GPT Generation
+                # GPT Generator (Streaming)
                 token_generator = self.t2s_model.model.infer_panel_naive(
                     inp_phones, inp_phones_len, inp_prompt, inp_bert, top_k=top_k, top_p=top_p,
                     temperature=temperature, early_stop_num=50 * 30, streaming_mode=True,
@@ -311,10 +319,8 @@ class GPTSoVITSLongInference:
                 curr_phones_tensor = torch.LongTensor(curr_phones).to(self.device).unsqueeze(0)
                 
                 chunk_queue = []
-                seg_tokens = []
-                
-                # State for this segment's streaming decoding
-                seg_history_tokens = None # history tokens within THIS segment for lookahead decoding
+                seg_tokens_collected = []
+                seg_history_tokens = None # inner-segment history for lookahead decoding
 
                 def decode_and_crop(tokens, hist, lookahead):
                     input_list = []
@@ -327,14 +333,18 @@ class GPTSoVITSLongInference:
                     full_chunk = torch.cat(input_list, dim=1)
                     audio = self.vq_model.decode(full_chunk.unsqueeze(0), curr_phones_tensor, [refer_spec], noise_scale=noise_scale, speed=speed, sv_emb=[sv_emb])
                     
-                    h_samples = min(hist.shape[1] if hist is not None else 0, h_len) * samples_per_token
-                    c_samples = tokens.shape[1] * samples_per_token
+                    # h_samples = min(hist.shape[1] if hist is not None else 0, h_len) * samples_per_token
+                    # Correct sample calculation with speed
+                    actual_samples_per_token = samples_per_token / speed
+                    h_samples = int((min(hist.shape[1] if hist is not None else 0, h_len)) * actual_samples_per_token)
+                    c_samples = int(tokens.shape[1] * actual_samples_per_token)
+                    
                     return audio[0, 0].cpu().float().numpy()[h_samples : h_samples + c_samples]
 
                 for chunk, is_last in token_generator:
                     if chunk is not None:
                         chunk_queue.append(chunk)
-                        seg_tokens.append(chunk)
+                        seg_tokens_collected.append(chunk)
                     
                     while len(chunk_queue) > 1:
                         curr = chunk_queue.pop(0)
@@ -343,7 +353,9 @@ class GPTSoVITSLongInference:
                         
                         if prev_fade_out is not None:
                             fade_in = np.linspace(0, 1, fade_len)
-                            audio_data[:fade_len] = audio_data[:fade_len] * fade_in + prev_fade_out * (1 - fade_in)
+                            # Handle potential size mismatch in extreme cases
+                            actual_fade = min(fade_len, len(audio_data))
+                            audio_data[:actual_fade] = audio_data[:actual_fade] * fade_in[:actual_fade] + prev_fade_out[:actual_fade] * (1 - fade_in[:actual_fade])
                         
                         prev_fade_out = audio_data[-fade_len:]
                         yield audio_data[:-fade_len]
@@ -355,20 +367,19 @@ class GPTSoVITSLongInference:
                         
                         if prev_fade_out is not None:
                             fade_in = np.linspace(0, 1, fade_len)
-                            audio_data[:fade_len] = audio_data[:fade_len] * fade_in + prev_fade_out * (1 - fade_in)
+                            actual_fade = min(fade_len, len(audio_data))
+                            audio_data[:actual_fade] = audio_data[:actual_fade] * fade_in[:actual_fade] + prev_fade_out[:actual_fade] * (1 - fade_in[:actual_fade])
                         
+                        # For the very last chunk of a segment, we might want to keep the fade_out for the next segment
                         yield audio_data[:-fade_len]
                         prev_fade_out = audio_data[-fade_len:]
 
-                # Update history for NEXT segment
-                history_phones = curr_phones
-                history_bert = curr_bert
-                history_tokens = torch.cat(seg_tokens, 1) if seg_tokens else torch.zeros((1, 0), device=self.device)
-                if history_tokens.shape[1] > 125:
-                    history_phones = history_phones[-75:] 
-                    history_bert = history_bert[:, -len(history_phones):]
-                    history_tokens = history_tokens[:, -125:]
-                
+                # Update sliding window history
+                seg_tokens_tensor = torch.cat(seg_tokens_collected, 1) if seg_tokens_collected else torch.zeros((1, 0), device=self.device)
+                sliding_history.append((curr_phones, curr_bert, seg_tokens_tensor))
+                if len(sliding_history) > history_window:
+                    sliding_history.pop(0)
+
                 # Add pause between segments
                 if i < len(segments) - 1 and pause_length > 0:
                     if prev_fade_out is not None:
@@ -376,40 +387,53 @@ class GPTSoVITSLongInference:
                         prev_fade_out = None
                     yield np.zeros(int(sr * pause_length), dtype=np.float32)
 
-            # Yield final remaining audio
+            # Yield remaining
             if prev_fade_out is not None:
                 yield prev_fade_out
-    
-            print("Long Inference Finished.")
 
 
 def launch_webui(args):
     import gradio as gr
-    inference = GPTSoVITSLongInference(args.gpt_path, args.sovits_path, args.cnhubert_base_path, args.bert_path)
+    inference = GPTSoVITSOptimizedInference(args.gpt_path, args.sovits_path, args.cnhubert_base_path, args.bert_path)
     
-    def predict(ref_audio, ref_text, ref_lang, text, lang, top_k, top_p, temperature, speed, chunk_length, noise_scale, pause_length):
+    def predict(ref_audio, ref_text, ref_lang, text, lang, top_k, top_p, temperature, speed, chunk_length, noise_scale, history_window, pause_length):
         if ref_audio is None or not text:
             return
         
         start_time = time.time()
-        gen = inference.infer_long(
+        first_packet_time = None
+        total_samples = 0
+        
+        gen = inference.infer_optimized(
             ref_audio, ref_text, ref_lang, text, lang,
             top_k=top_k, top_p=top_p, temperature=temperature, 
             speed=speed, chunk_length=chunk_length, noise_scale=noise_scale,
-            pause_length=pause_length
+            history_window=int(history_window), pause_length=pause_length
         )
         
-        latency = None
         sr = inference.hps.data.sampling_rate
+        last_chunk = None
         for audio_chunk in gen:
-            if latency is None:
-                latency = time.time() - start_time
-                yield (sr, (audio_chunk * 32768).astype(np.int16)), f"{latency:.3f}s"
-            else:
-                yield (sr, (audio_chunk * 32768).astype(np.int16)), f"{latency:.3f}s"
+            if first_packet_time is None:
+                first_packet_time = time.time()
+                latency = first_packet_time - start_time
+            
+            total_samples += len(audio_chunk)
+            if last_chunk is not None:
+                yield (sr, (last_chunk * 32768).astype(np.int16)), f"{latency:.3f}s", "", ""
+            last_chunk = audio_chunk
 
-    with gr.Blocks(title="GPT-SoVITS Long Streaming Inference") as app:
-        gr.Markdown("# GPT-SoVITS Long Streaming Inference")
+        if last_chunk is not None:
+            end_time = time.time()
+            total_duration = total_samples / sr
+            total_inference_time = end_time - start_time
+            rtf = total_inference_time / total_duration if total_duration > 0 else 0
+            yield (sr, (last_chunk * 32768).astype(np.int16)), f"{latency:.3f}s", f"{total_duration:.2f}s", f"{rtf:.3f}"
+
+    with gr.Blocks(title="GPT-SoVITS Optimized Inference (Streaming + Long Context)") as app:
+        gr.Markdown("# GPT-SoVITS Optimized Inference")
+        gr.Markdown("Combined Streaming (for low latency) and Long-Context (for better cross-sentence consistency).")
+        
         with gr.Row():
             with gr.Column():
                 ref_audio = gr.Audio(label="Reference Audio", type="filepath")
@@ -418,32 +442,38 @@ def launch_webui(args):
                 target_text = gr.Textbox(label="Target Text", lines=5, value=args.text)
                 target_lang = gr.Dropdown(label="Target Language", choices=["zh", "en", "ja", "ko", "yue", "auto", "auto_yue"], value=args.lang)
                 
-                with gr.Accordion("Advanced Settings", open=False):
+                with gr.Accordion("Optimization Settings", open=True):
+                    history_window = gr.Slider(label="History Window (Sentences)", minimum=0, maximum=10, step=1, value=4)
+                    chunk_length = gr.Slider(label="GPT Chunk Length", minimum=10, maximum=100, step=1, value=24)
+                    speed = gr.Slider(label="Speed", minimum=0.5, maximum=2.0, step=0.1, value=1.0)
+                    pause_length = gr.Slider(label="Pause Length", minimum=0.0, maximum=1.0, step=0.05, value=0.3)
+
+                with gr.Accordion("Advanced Model Settings", open=False):
                     top_k = gr.Slider(label="Top K", minimum=1, maximum=100, step=1, value=15)
                     top_p = gr.Slider(label="Top P", minimum=0.1, maximum=1.0, step=0.05, value=1.0)
                     temperature = gr.Slider(label="Temperature", minimum=0.1, maximum=2.0, step=0.05, value=1.0)
-                    speed = gr.Slider(label="Speed", minimum=0.5, maximum=2.0, step=0.1, value=1.0)
                     noise_scale = gr.Slider(label="Noise Scale", minimum=0.0, maximum=1.0, step=0.05, value=0.35)
-                    chunk_length = gr.Slider(label="Chunk Length", minimum=10, maximum=100, step=1, value=24)
-                    pause_length = gr.Slider(label="Pause Length", minimum=0.0, maximum=1.0, step=0.05, value=0.3)
                 
                 btn = gr.Button("Generate", variant="primary")
             
             with gr.Column():
                 audio_output = gr.Audio(label="Output Audio", streaming=True, autoplay=True)
-                latency_label = gr.Textbox(label="首包延迟 (First Packet Latency)", interactive=False)
+                with gr.Row():
+                    latency_label = gr.Textbox(label="首包延迟 (First Packet Latency)", interactive=False)
+                    duration_label = gr.Textbox(label="音频总时长 (Total Duration)", interactive=False)
+                    rtf_label = gr.Textbox(label="实时率 (RTF)", interactive=False)
 
         btn.click(
             predict,
-            inputs=[ref_audio, ref_text, ref_lang, target_text, target_lang, top_k, top_p, temperature, speed, chunk_length, noise_scale, pause_length],
-            outputs=[audio_output, latency_label]
+            inputs=[ref_audio, ref_text, ref_lang, target_text, target_lang, top_k, top_p, temperature, speed, chunk_length, noise_scale, history_window, pause_length],
+            outputs=[audio_output, latency_label, duration_label, rtf_label]
         )
 
     app.queue().launch(server_name=args.host, server_port=args.port, share=args.share)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GPT-SoVITS Long Inference")
+    parser = argparse.ArgumentParser(description="GPT-SoVITS Optimized Inference")
     parser.add_argument("--gpt_path", required=True)
     parser.add_argument("--sovits_path", required=True)
     parser.add_argument("--cnhubert_base_path", default="pretrained_models/chinese-hubert-base")
@@ -453,16 +483,15 @@ if __name__ == "__main__":
     parser.add_argument("--ref_lang", default="zh")
     parser.add_argument("--text", default="")
     parser.add_argument("--lang", default="zh")
-    parser.add_argument("--output", default="out_long.wav")
-    parser.add_argument("--chunk_length", type=int, default=24)
-    parser.add_argument("--noise_scale", type=float, default=0.35)
+    parser.add_argument("--output", default="out_optimized.wav")
+    parser.add_argument("--history_window", type=int, default=4)
     parser.add_argument("--pause_length", type=float, default=0.3)
     
     # WebUI arguments
     parser.add_argument("--webui", action="store_true", help="Launch WebUI")
     parser.add_argument("--share", action="store_true", help="Share Gradio app")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=9880)
+    parser.add_argument("--port", type=int, default=9882)
 
     args = parser.parse_args()
 
@@ -471,10 +500,9 @@ if __name__ == "__main__":
     else:
         if not args.ref_audio or not args.text:
             parser.error("--ref_audio and --text are required in CLI mode")
-        inference = GPTSoVITSLongInference(args.gpt_path, args.sovits_path, args.cnhubert_base_path, args.bert_path)
+        inference = GPTSoVITSOptimizedInference(args.gpt_path, args.sovits_path, args.cnhubert_base_path, args.bert_path)
         full_audio = []
-        for audio_chunk in inference.infer_long(args.ref_audio, args.ref_text, args.ref_lang, args.text, args.lang, 
-                                                chunk_length=args.chunk_length, noise_scale=args.noise_scale, pause_length=args.pause_length):
+        for audio_chunk in inference.infer_optimized(args.ref_audio, args.ref_text, args.ref_lang, args.text, args.lang, history_window=args.history_window, pause_length=args.pause_length):
             full_audio.append(audio_chunk)
         
         if full_audio:
