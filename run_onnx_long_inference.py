@@ -94,7 +94,7 @@ class GPTSoVITS_ONNX_Long_Inference:
         t_start = time.perf_counter()
         wav16k, _ = librosa.load(ref_wav_path, sr=16000)
         wav16k_padded = np.concatenate([wav16k.astype(self.precision), np.zeros(int(16000 * 0.3), dtype=self.precision)])[None, :]
-        ssl_content = self.sess_ssl.run(None, {"audio": wav16k_padded})[0].transpose(0, 2, 1)
+        ssl_content = self.sess_ssl.run(None, {"audio": wav16k_padded})[0]
         prompt_semantic = self.sess_vq.run(None, {"ssl_content": ssl_content.astype(self.precision)})[0][0, 0][None, :]
         t_ref_audio += time.perf_counter() - t_start
         

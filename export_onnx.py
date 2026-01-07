@@ -169,15 +169,24 @@ def export_onnx(args):
     
     print(f"Exporting to {output_dir}...")
     print("Exporting SSL...")
+    class SSLWrapper(nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+        def forward(self, audio):
+            # HubertModel returns [B, T, C], we need [B, C, T] for VQEncoder
+            return self.model(audio).last_hidden_state.transpose(1, 2)
+
+    ssl_wrapper = SSLWrapper(ssl_model.model)
     # Input: [1, T] audio 16k
-    dummy_audio = torch.randn(1, 16000*2)
+    dummy_audio = torch.randn(1, 16000 * 2)
     torch.onnx.export(
-        ssl_model.model,
+        ssl_wrapper,
         (dummy_audio,),
         f"{output_dir}/ssl.onnx",
         input_names=["audio"],
         output_names=["last_hidden_state"],
-        dynamic_axes={"audio": {1: "time"}, "last_hidden_state": {1: "time"}},
+        dynamic_axes={"audio": {1: "time"}, "last_hidden_state": {2: "time"}},
         opset_version=18,
         dynamo=False
     )

@@ -135,8 +135,8 @@ class GPTSoVITS_ONNX_Streaming_Inference:
         t_start = time.perf_counter()
         wav16k, _ = librosa.load(ref_wav_path, sr=16000)
         wav16k_padded = np.concatenate([wav16k.astype(self.precision), np.zeros(int(16000 * 0.3), dtype=self.precision)])[None, :]
-        ssl_content = self.run_sess(self.sess_ssl, {"audio": wav16k_padded})[0].transpose(0, 2, 1)
-        prompt_semantic = self.run_sess(self.sess_vq, {"ssl_content": ssl_content})[0][0, 0][None, :]
+        ssl_content = self.run_sess(self.sess_ssl, {"audio": wav16k_padded})[0]
+        codes = self.run_sess(self.sess_vq, {"ssl_content": ssl_content})[0]
         t_ref_audio += time.perf_counter() - t_start
 
         # Text Prep

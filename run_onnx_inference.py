@@ -1,3 +1,5 @@
+import re
+
 import onnxruntime
 import torch
 import numpy as np
@@ -349,8 +351,8 @@ class GPTSoVITS_ONNX_Inference:
         wav16k_padded = np.concatenate([wav16k, zero_wav])[None, :]
 
         ssl_content = self.run_sess(self.sess_ssl, {"audio": wav16k_padded})[0]
-        ssl_content = ssl_content.transpose(0, 2, 1)
-
+        # ssl_content is now [1, 768, T] from the updated ONNX export
+        
         codes = self.run_sess(self.sess_vq, {"ssl_content": ssl_content})[0]
         prompt_semantic = codes[0, 0][None, :]
         t_ref_audio = time.perf_counter() - t_start
