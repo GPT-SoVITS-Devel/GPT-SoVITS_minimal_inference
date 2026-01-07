@@ -1,4 +1,6 @@
 import os
+import re
+import time
 
 os.environ['http_proxy'] = "http://192.168.1.50:10809"
 os.environ['https_proxy'] = "http://192.168.1.50:10809"
@@ -155,6 +157,17 @@ class GPTSoVITSInference:
         # We initialize it if needed or just always init for simplicity in this minimal script
         self.sv_model = SV(device, is_half)
 
+        self.warmup()
+
+    def warmup(self):
+        print("Warming up models (tokenizer, BERT, etc.)...")
+        # Warmup text cleaning and BERT (common sources of initial delay)
+        try:
+            _ = self.get_phones_and_bert("Warmup text.", "en", self.hps.model.version)
+            _ = self.get_phones_and_bert("你好，预热文本。", "zh", self.hps.model.version)
+        except Exception as e:
+            print(f"Warmup failed (non-critical): {e}")
+
     def get_bert_feature(self, text, word2ph):
         with torch.no_grad():
             inputs = self.tokenizer(text, return_tensors="pt")
@@ -277,6 +290,7 @@ class GPTSoVITSInference:
 
         print(f"Inferencing: {text} ({text_lang})")
         
+        t_all_start = time.perf_counter()
         segments = split_text(text)
         if not segments:
             return np.zeros(0), self.hps.data.sampling_rate
@@ -285,6 +299,7 @@ class GPTSoVITSInference:
         sr = self.hps.data.sampling_rate
 
         # Process Reference
+        t_ref_start = time.perf_counter()
         zero_wav = torch.zeros(
             int(self.hps.data.sampling_rate * 0.3),
             dtype=torch.float16 if self.is_half else torch.float32
@@ -313,17 +328,27 @@ class GPTSoVITSInference:
 
         # Process Reference Text (Once)
         phones1, bert1, norm_text1 = self.get_phones_and_bert(prompt_text, prompt_lang, self.hps.model.version)
+        t_ref_end = time.perf_counter()
+
+        total_text_time = 0
+        total_gpt_time = 0
+        total_sovits_time = 0
 
         for i, seg in enumerate(segments):
             print(f"Processing segment {i+1}/{len(segments)}: {seg}")
-            # 2. Process Text Segment
+            
+            # Process Text Segment
+            t_seg_text_start = time.perf_counter()
             phones2, bert2, norm_text2 = self.get_phones_and_bert(seg, text_lang, self.hps.model.version)
+            t_seg_text_end = time.perf_counter()
+            total_text_time += (t_seg_text_end - t_seg_text_start)
 
             bert = torch.cat([bert1, bert2], 1).unsqueeze(0).to(self.device)
             all_phoneme_ids = torch.LongTensor(phones1 + phones2).to(self.device).unsqueeze(0)
             all_phoneme_len = torch.tensor([all_phoneme_ids.shape[-1]]).to(self.device)
 
             # GPT Inference
+            t_gpt_start = time.perf_counter()
             with torch.no_grad():
                 pred_semantic, idx = self.t2s_model.model.infer_panel(
                     all_phoneme_ids,
@@ -336,7 +361,12 @@ class GPTSoVITSInference:
                     early_stop_num=50 * 30  # max_sec
                 )
                 pred_semantic = pred_semantic[:, -idx:].unsqueeze(0)
+            t_gpt_end = time.perf_counter()
+            total_gpt_time += (t_gpt_end - t_gpt_start)
 
+            # SoVITS Decoding
+            t_sovits_start = time.perf_counter()
+            with torch.no_grad():
                 # Standard V2/V2Pro decoding
                 audio = self.vq_model.decode(
                     pred_semantic,
@@ -345,10 +375,22 @@ class GPTSoVITSInference:
                     speed=speed,
                     sv_emb=[sv_emb]  # List of sv_embs
                 )[0][0]
+            t_sovits_end = time.perf_counter()
+            total_sovits_time += (t_sovits_end - t_sovits_start)
                 
-                final_audios.append(audio.cpu().float().numpy())
-                if i < len(segments) - 1 and pause_length > 0:
-                    final_audios.append(np.zeros(int(sr * pause_length)))
+            final_audios.append(audio.cpu().float().numpy())
+            if i < len(segments) - 1 and pause_length > 0:
+                final_audios.append(np.zeros(int(sr * pause_length)))
+
+        t_all_end = time.perf_counter()
+        
+        print(f"\n--- Inference Performance Summary ---")
+        print(f"Reference Processing:  {t_ref_end - t_ref_start:.3f}s")
+        print(f"Target Text Cleaning:  {total_text_time:.3f}s")
+        print(f"GPT Semantic Gen:      {total_gpt_time:.3f}s")
+        print(f"SoVITS Audio Decode:   {total_sovits_time:.3f}s")
+        print(f"Total Inference Time:  {t_all_end - t_all_start:.3f}s")
+        print(f"-------------------------------------\n")
 
         return np.concatenate(final_audios), sr
 
