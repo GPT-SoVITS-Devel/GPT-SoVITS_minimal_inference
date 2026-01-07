@@ -49,6 +49,16 @@ class GPTEncoder(nn.Module):
         # Optimization: Return Top-K instead of full logits
         topk_values, topk_indices = torch.topk(logits, k=50, dim=-1)
         
+        # Ensure x_len and y_len are rank-1 tensors for ONNX export dynamic axes
+        if not isinstance(x_len, torch.Tensor):
+            x_len = torch.tensor([x_len], dtype=torch.long)
+        else:
+            x_len = x_len.reshape(1)
+        if not isinstance(y_len, torch.Tensor):
+            y_len = torch.tensor([y_len], dtype=torch.long)
+        else:
+            y_len = y_len.reshape(1)
+        
         return topk_values, topk_indices, k_cache_padded, v_cache_padded, x_len, y_len
 
 class GPTStep(nn.Module):
@@ -60,12 +70,17 @@ class GPTStep(nn.Module):
         # Wrapper for infer_next_stage
         # k_cache, v_cache are stacked [Layers, B, T_max, D]
         
+        # Ensure x_len, y_len, idx are scalars for the underlying model if they come as rank-1
+        x_len_s = x_len[0] if x_len.ndim > 0 else x_len
+        y_len_s = y_len[0] if y_len.ndim > 0 else y_len
+        idx_s = idx[0] if idx.ndim > 0 else idx
+
         # Unstack to list
         k_cache_list = [t for t in k_cache]
         v_cache_list = [t for t in v_cache]
         
         logits, k_cache_new, v_cache_new = self.t2s_model.model.infer_next_stage(
-            samples, k_cache_list, v_cache_list, x_len, y_len, idx
+            samples, k_cache_list, v_cache_list, x_len_s, y_len_s, idx_s
         )
         
         # Stack again (they should still be the same tensors if updated in-place)
@@ -246,6 +261,8 @@ def export_onnx(args):
         "bert_feature": {2: "text_len"},
         "k_cache": {1: "batch_size"},
         "v_cache": {1: "batch_size"},
+        "x_len": {0: "one"},
+        "y_len": {0: "one"},
     }
     
     torch.onnx.export(
@@ -272,6 +289,9 @@ def export_onnx(args):
     dynamic_axes_step = {
         "k_cache": {1: "batch_size"},
         "v_cache": {1: "batch_size"},
+        "x_len": {0: "one"},
+        "y_len": {0: "one"},
+        "idx": {0: "one"},
     }
     
     torch.onnx.export(
