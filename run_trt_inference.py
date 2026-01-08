@@ -396,218 +396,187 @@ class GPTSoVITS_TRT_Inference:
         t_gpt_enc = 0.0
         t_gpt_dec = 0.0
         t_sovits = 0.0
-        steps = 0
+        t_first_segment = 0.0
+        total_steps = 0
 
+        if self.device.type == "cuda": torch.cuda.synchronize()
         t_total_start = time.perf_counter()
 
         with torch.cuda.stream(self.stream):
             # Audio
             t_start = time.perf_counter()
             wav16k, _ = librosa.load(ref_wav_path, sr=16000)
-        wav16k = torch.from_numpy(wav16k).to(self.device).to(self.precision)
-        zero_wav = torch.zeros(int(16000 * 0.3), device=self.device, dtype=self.precision)
-        wav16k_padded = torch.cat([wav16k, zero_wav])[None, :]
+            wav16k = torch.from_numpy(wav16k).to(self.device).to(self.precision)
+            zero_wav = torch.zeros(int(16000 * 0.3), device=self.device, dtype=self.precision)
+            wav16k_padded = torch.cat([wav16k, zero_wav])[None, :]
 
-        ssl_content = self.model_ssl({"audio": wav16k_padded})["last_hidden_state"]
-        # In TRT, shapes should match what was exported.
-        # onnx_export.py typically exports [1, 768, T] or [1, T, 768]. 
-        # run_onnx_inference.py suggests it's [1, 768, T] now.
-        
-        codes = self.model_vq({"ssl_content": ssl_content})["codes"]
-        prompt_semantic = codes[0, 0][None, :]
-        t_ref_audio = time.perf_counter() - t_start
+            ssl_content = self.model_ssl({"audio": wav16k_padded})["last_hidden_state"]
+            codes = self.model_vq({"ssl_content": ssl_content})["codes"]
+            prompt_semantic = codes[0, 0][None, :]
+            if self.device.type == "cuda": torch.cuda.synchronize()
+            t_ref_audio = time.perf_counter() - t_start
 
-        # Text segments
-        segments = split_text(text)
-        if not segments:
-            return
+            # Text segments
+            segments = split_text(text)
+            if not segments:
+                return
 
-        final_audios = []
-        sr = self.hps["data"]["sampling_rate"]
+            final_audios = []
+            sr = self.hps["data"]["sampling_rate"]
 
-        # SoVITS Setup
-        wav_ref, _ = librosa.load(ref_wav_path, sr=sr)
-        spec = spectrogram_torch(torch.from_numpy(wav_ref)[None, :], self.hps["data"]["filter_length"], self.hps["data"]["sampling_rate"],
-                                 self.hps["data"]["hop_length"], self.hps["data"]["win_length"], center=False).to(self.device).to(self.precision)
+            # SoVITS Setup
+            wav_ref, _ = librosa.load(ref_wav_path, sr=sr)
+            spec = spectrogram_torch(torch.from_numpy(wav_ref)[None, :], self.hps["data"]["filter_length"], self.hps["data"]["sampling_rate"],
+                                     self.hps["data"]["hop_length"], self.hps["data"]["win_length"], center=False).to(self.device).to(self.precision)
 
-        wav16k_sv, _ = librosa.load(ref_wav_path, sr=16000)
-        sv_emb = self.sv_model.compute_embedding3(torch.from_numpy(wav16k_sv).to(self.device)[None, :]).detach()
+            wav16k_sv, _ = librosa.load(ref_wav_path, sr=16000)
+            sv_emb = self.sv_model.compute_embedding3(torch.from_numpy(wav16k_sv).to(self.device)[None, :]).detach()
 
-        sv_size = 20480 if "Pro" in self.version else 512
-        if sv_emb.shape[-1] != sv_size:
-            tmp = torch.zeros((1, sv_size), device=self.device, dtype=torch.float32)
-            tmp[:, :min(sv_emb.shape[-1], sv_size)] = sv_emb[:, :min(sv_emb.shape[-1], sv_size)]
-            sv_emb = tmp
-        sv_emb = sv_emb.to(self.precision)
+            sv_size = 20480 if "Pro" in self.version else 512
+            if sv_emb.shape[-1] != sv_size:
+                tmp = torch.zeros((1, sv_size), device=self.device, dtype=torch.float32)
+                tmp[:, :min(sv_emb.shape[-1], sv_size)] = sv_emb[:, :min(sv_emb.shape[-1], sv_size)]
+                sv_emb = tmp
+            sv_emb = sv_emb.to(self.precision)
 
-        # Process Reference Text
-        t_start = time.perf_counter()
-        phones1, bert1, norm_text1 = self.get_phones_and_bert(prompt_text, prompt_lang, self.version)
-        t_text_proc += time.perf_counter() - t_start
-
-        for seg_idx, seg in enumerate(segments):
-            print(f"Processing segment {seg_idx+1}/{len(segments)}: {seg}")
+            # Process Reference Text
             t_start = time.perf_counter()
-            phones2, bert2, norm_text2 = self.get_phones_and_bert(seg, text_lang, self.version)
-
-            bert = torch.cat([bert1, bert2], dim=1)[None, :, :].to(self.precision)
-
-            all_phoneme_ids = torch.tensor(phones1 + phones2, dtype=torch.int64, device=self.device)[None, :]
-            all_phoneme_len = torch.tensor([all_phoneme_ids.shape[1]], dtype=torch.int64, device=self.device)
+            phones1, bert1, norm_text1 = self.get_phones_and_bert(prompt_text, prompt_lang, self.version)
+            if self.device.type == "cuda": torch.cuda.synchronize()
             t_text_proc += time.perf_counter() - t_start
 
-            # GPT Encoder
-            t_start = time.perf_counter()
-            gpt_enc_out = self.model_gpt_enc({
-                "phoneme_ids": all_phoneme_ids,
-                "phoneme_ids_len": all_phoneme_len,
-                "prompts": prompt_semantic.to(torch.int64),
-                "bert_feature": bert
-            })
-            t_gpt_enc += time.perf_counter() - t_start
-            
-            # Use CPU sampling for consistency and to avoid sync issues in the loop
-            topk_values = gpt_enc_out["topk_values"].detach().cpu()
-            topk_indices = gpt_enc_out["topk_indices"].detach().cpu()
-            k_cache = gpt_enc_out["k_cache"]
-            v_cache = gpt_enc_out["v_cache"]
-            x_len = gpt_enc_out["x_len"]
-            y_len = gpt_enc_out["y_len"]
+            for seg_idx, seg in enumerate(segments):
+                print(f"Processing segment {seg_idx+1}/{len(segments)}: {seg}")
+                
+                # Text Segment
+                t_seg_start = time.perf_counter()
+                phones2, bert2, norm_text2 = self.get_phones_and_bert(seg, text_lang, self.version)
+                bert = torch.cat([bert1, bert2], dim=1)[None, :, :].to(self.precision)
+                all_phoneme_ids = torch.tensor(phones1 + phones2, dtype=torch.int64, device=self.device)[None, :]
+                all_phoneme_len = torch.tensor([all_phoneme_ids.shape[1]], dtype=torch.int64, device=self.device)
+                if self.device.type == "cuda": torch.cuda.synchronize()
+                t_text_proc += time.perf_counter() - t_seg_start
 
-            current_samples = sample_topk(topk_values, topk_indices, temperature=temperature).to(self.device)
-            # Ensure prompt_semantic is on the same device as generated samples
-            prompt_semantic_gpu = prompt_semantic.to(self.device)
-            decoded_semantic_list = [prompt_semantic_gpu, current_samples]
+                # GPT Encoder
+                t_enc_start = time.perf_counter()
+                gpt_enc_out = self.model_gpt_enc({
+                    "phoneme_ids": all_phoneme_ids,
+                    "phoneme_ids_len": all_phoneme_len,
+                    "prompts": prompt_semantic.to(torch.int64),
+                    "bert_feature": bert
+                })
+                if self.device.type == "cuda": torch.cuda.synchronize()
+                t_gpt_enc += time.perf_counter() - t_enc_start
+                
+                topk_values = gpt_enc_out["topk_values"].detach().cpu()
+                topk_indices = gpt_enc_out["topk_indices"].detach().cpu()
+                k_cache = gpt_enc_out["k_cache"]
+                v_cache = gpt_enc_out["v_cache"]
+                x_len = gpt_enc_out["x_len"]
+                y_len = gpt_enc_out["y_len"]
 
-            # GPT Step
-            t_dec_start = time.perf_counter()
-            # Detect KV cache limit from k_cache shape [Layers, B, T_max, D]
-            kv_max_len = k_cache.shape[2]
-            
-            # The number of tokens already in the cache (prompt + reference)
-            base_len = int(x_len.item() + y_len.item())
-            max_gen_len = kv_max_len - base_len - 1
-            if max_gen_len <= 0:
-                print(f"  - Warning: Prompt length ({base_len}) exceeds/approaches KV cache limit ({kv_max_len})!")
-                max_gen_len = 1
-            
-            max_steps = min(1000, max_gen_len) 
-            
-            # Double buffering for KV cache. 
-            k_cache_0 = k_cache.clone()
-            v_cache_0 = v_cache.clone()
-            k_cache_1 = torch.zeros_like(k_cache_0)
-            v_cache_1 = torch.zeros_like(v_cache_0)
-            
-            # Pre-move indexing tensors to correct device
-            def prepare_tensor(name, tensor, module):
-                target_loc = module.tensor_location.get(name, trt.TensorLocation.DEVICE)
-                if target_loc == trt.TensorLocation.HOST:
-                    return tensor.detach().cpu().to(torch.int64)
-                else:
-                    return tensor.detach().to(self.device).to(torch.int64)
+                current_samples = sample_topk(topk_values, topk_indices, temperature=temperature).to(self.device)
+                prompt_semantic_gpu = prompt_semantic.to(self.device)
+                decoded_semantic_list = [prompt_semantic_gpu, current_samples]
 
-            x_len_opt = prepare_tensor("x_len", x_len, self.model_gpt_step)
-            y_len_opt = prepare_tensor("y_len", y_len, self.model_gpt_step)
-            
-            caches = [(k_cache_0, v_cache_0), (k_cache_1, v_cache_1)]
-            
-            seg_steps = 0
-            # Pre-allocate indices on correct device
-            idx_loc = self.model_gpt_step.tensor_location.get("idx", trt.TensorLocation.DEVICE)
-            idx_device = "cpu" if idx_loc == trt.TensorLocation.HOST else self.device
-            idx_tensors = [torch.tensor([i], dtype=torch.int64, device=idx_device) for i in range(max_steps)]
-            
-            # Optimization: Pre-bind unchanging outputs to avoid dict creation
-            step_outputs = {"k_cache_new": None, "v_cache_new": None}
+                # GPT Step
+                t_dec_start = time.perf_counter()
+                kv_max_len = k_cache.shape[2]
+                base_len = int(x_len.item() + y_len.item())
+                max_gen_len = kv_max_len - base_len - 1
+                max_steps = min(1000, max_gen_len) if max_gen_len > 0 else 1
+                
+                k_cache_0, v_cache_0 = k_cache.clone(), v_cache.clone()
+                k_cache_1, v_cache_1 = torch.zeros_like(k_cache_0), torch.zeros_like(v_cache_0)
+                
+                def prepare_tensor(name, tensor, module):
+                    target_loc = module.tensor_location.get(name, trt.TensorLocation.DEVICE)
+                    return tensor.detach().cpu().to(torch.int64) if target_loc == trt.TensorLocation.HOST else tensor.detach().to(self.device).to(torch.int64)
 
-            for i in range(max_steps):
-                idx_tensor = idx_tensors[i]
+                x_len_opt = prepare_tensor("x_len", x_len, self.model_gpt_step)
+                y_len_opt = prepare_tensor("y_len", y_len, self.model_gpt_step)
+                caches = [(k_cache_0, v_cache_0), (k_cache_1, v_cache_1)]
                 
-                src_cache = caches[i % 2]
-                dst_cache = caches[(i + 1) % 2]
-                step_outputs["k_cache_new"] = dst_cache[0]
-                step_outputs["v_cache_new"] = dst_cache[1]
-                
-                # Execute WITHOUT explicit stream sync inside TRTModule
-                step_out = self.model_gpt_step({
-                    "samples": current_samples.to(torch.int64),
-                    "k_cache": src_cache[0],
-                    "v_cache": src_cache[1],
-                    "idx": idx_tensor,
-                    "x_len": x_len_opt,
-                    "y_len": y_len_opt
-                }, outputs=step_outputs, sync=False)
-                
-                # We need topk_values and topk_indices on CPU for break check and sampling (to match ONNX speed)
-                # This access will trigger an implicit synchronization for these specific tensors
-                topk_v = step_out["topk_values"].detach().cpu()
-                topk_i = step_out["topk_indices"].detach().cpu()
-                
-                # CPU sampling (often faster for small N=50 than GPU launch overhead + sync)
-                if temperature != 1.0:
-                    topk_v = topk_v / temperature
-                probs = torch.softmax(topk_v, dim=-1)
-                indices_of_indices = torch.multinomial(probs, num_samples=1)
-                current_samples = torch.gather(topk_i, -1, indices_of_indices).to(self.device)
-                
-                decoded_semantic_list.append(current_samples)
-                seg_steps += 1
-                
-                if current_samples[0, 0] == 1024:
-                    break
-            
-            steps += seg_steps
-            # Debug: check if the loop ended early
-            print(f"  - Segment finished in {seg_steps} steps (Last token: {current_samples[0,0]})")
-            t_gpt_dec += time.perf_counter() - t_dec_start
+                seg_steps = 0
+                idx_loc = self.model_gpt_step.tensor_location.get("idx", trt.TensorLocation.DEVICE)
+                idx_device = "cpu" if idx_loc == trt.TensorLocation.HOST else self.device
+                idx_tensors = [torch.tensor([i], dtype=torch.int64, device=idx_device) for i in range(max_steps)]
+                step_outputs = {"k_cache_new": None, "v_cache_new": None}
 
-            pred_semantic = torch.cat(decoded_semantic_list, dim=1)
-            generated_sem = pred_semantic[:, prompt_semantic.shape[1]:]
-            if generated_sem[0, -1] == 1024: generated_sem = generated_sem[:, :-1]
-            
-            # Final safety check: Truncate to engine limit if necessary
-            if generated_sem.shape[1] > 1000:
-                generated_sem = generated_sem[:, :1000]
+                for i in range(max_steps):
+                    idx_tensor = idx_tensors[i]
+                    src_cache, dst_cache = caches[i % 2], caches[(i + 1) % 2]
+                    step_outputs["k_cache_new"], step_outputs["v_cache_new"] = dst_cache[0], dst_cache[1]
+                    
+                    step_out = self.model_gpt_step({
+                        "samples": current_samples.to(torch.int64),
+                        "k_cache": src_cache[0], "v_cache": src_cache[1],
+                        "idx": idx_tensor, "x_len": x_len_opt, "y_len": y_len_opt
+                    }, outputs=step_outputs, sync=False)
+                    
+                    topk_v, topk_i = step_out["topk_values"].detach().cpu(), step_out["topk_indices"].detach().cpu()
+                    if temperature != 1.0: topk_v = topk_v / temperature
+                    probs = torch.softmax(topk_v, dim=-1)
+                    indices_of_indices = torch.multinomial(probs, num_samples=1)
+                    current_samples = torch.gather(topk_i, -1, indices_of_indices).to(self.device)
+                    
+                    decoded_semantic_list.append(current_samples)
+                    seg_steps += 1
+                    if current_samples[0, 0] == 1024: break
                 
-            generated_sem = generated_sem[:, None, :]
+                if self.device.type == "cuda": torch.cuda.synchronize()
+                t_gpt_dec += time.perf_counter() - t_dec_start
+                total_steps += seg_steps
 
-            # SoVITS
-            t_start = time.perf_counter()
-            sovits_inputs = {
-                "pred_semantic": generated_sem.to(torch.int64),
-                "text_seq": torch.tensor(phones2, dtype=torch.int64, device=self.device)[None, :],
-                "refer_spec": spec,
-                "sv_emb": sv_emb,
-                "noise_scale": torch.tensor([noise_scale], dtype=torch.float32, device=self.device),
-                "speed": torch.tensor([speed], dtype=torch.float32, device=self.device),
-            }
-            # Only pass inputs that exist in the engine
-            sovits_inputs = {k: v for k, v in sovits_inputs.items() if k in self.model_sovits.input_names}
-            
-            audio = self.model_sovits(sovits_inputs)["audio"]
-            t_sovits += time.perf_counter() - t_start
-            
-            final_audios.append(audio.squeeze().detach().cpu().numpy())
-            if seg_idx < len(segments) - 1 and pause_length > 0:
-                final_audios.append(np.zeros(int(sr * pause_length)))
+                pred_semantic = torch.cat(decoded_semantic_list, dim=1)
+                generated_sem = pred_semantic[:, prompt_semantic.shape[1]:]
+                if generated_sem[0, -1] == 1024: generated_sem = generated_sem[:, :-1]
+                generated_sem = generated_sem[:, None, :]
+
+                # SoVITS
+                t_sov_start = time.perf_counter()
+                sovits_inputs = {
+                    "pred_semantic": generated_sem.to(torch.int64),
+                    "text_seq": torch.tensor(phones2, dtype=torch.int64, device=self.device)[None, :],
+                    "refer_spec": spec, "sv_emb": sv_emb,
+                    "noise_scale": torch.tensor([noise_scale], dtype=torch.float32, device=self.device),
+                    "speed": torch.tensor([speed], dtype=torch.float32, device=self.device),
+                }
+                sovits_inputs = {k: v for k, v in sovits_inputs.items() if k in self.model_sovits.input_names}
+                audio = self.model_sovits(sovits_inputs)["audio"]
+                if self.device.type == "cuda": torch.cuda.synchronize()
+                t_sovits += time.perf_counter() - t_sov_start
+                
+                audio_np = audio.squeeze().detach().cpu().numpy()
+                final_audios.append(audio_np)
+                
+                if seg_idx == 0:
+                    t_first_segment = time.perf_counter() - t_total_start
+
+                if seg_idx < len(segments) - 1 and pause_length > 0:
+                    final_audios.append(np.zeros(int(sr * pause_length)))
 
         t_total = time.perf_counter() - t_total_start
         
         full_audio = np.concatenate(final_audios).astype(np.float32)
         sf.write(output_path, full_audio, sr)
         print(f"Saved audio to {output_path}")
-        
-        # Report
-        t_step_avg = t_gpt_dec / steps if steps > 0 else 0.0
-        print("\n--- Inference Timings (TensorRT) ---")
-        print(f"Ref Audio (SSL+VQ):   {t_ref_audio:.4f}s")
-        print(f"Text (Cleaning+BERT): {t_text_proc:.4f}s")
-        print(f"GPT Encoder:          {t_gpt_enc:.4f}s")
-        print(f"GPT Decoding:         {t_gpt_dec:.4f}s ({steps} steps, {t_step_avg:.5f}s/step)")
-        print(f"SoVITS Decoder:       {t_sovits:.4f}s")
-        print(f"Total Time:           {t_total:.4f}s")
-        print("-------------------------------------")
+
+        # Performance Summary
+        total_audio_duration = len(full_audio) / sr
+        rtf = t_total / total_audio_duration if total_audio_duration > 0 else 0
+        gpt_tps = total_steps / t_gpt_dec if t_gpt_dec > 0 else 0
+
+        print("\n--- Inference Performance Summary (TensorRT) ---")
+        print(f"Reference Processing:  {t_ref_audio:.3f}s")
+        print(f"Target Text Cleaning:  {t_text_proc:.3f}s")
+        print(f"GPT Semantic Gen:      {t_gpt_enc + t_gpt_dec:.3f}s ({gpt_tps:.2f} tokens/s)")
+        print(f"SoVITS Audio Decode:   {t_sovits:.3f}s")
+        print(f"First Segment Latency: {t_first_segment:.3f}s")
+        print(f"Total Audio Duration:  {total_audio_duration:.3f}s")
+        print(f"Total Inference Time:  {t_total:.3f}s")
+        print(f"Real Time Factor (RTF): {rtf:.4f}")
+        print("----------------------------------------------\n")
 
 
 if __name__ == "__main__":

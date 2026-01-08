@@ -160,11 +160,41 @@ class GPTSoVITSInference:
         self.warmup()
 
     def warmup(self):
-        print("Warming up models (tokenizer, BERT, etc.)...")
+        print("Warming up models (GPT, SoVITS, BERT, etc.)...")
         # Warmup text cleaning and BERT (common sources of initial delay)
         try:
-            _ = self.get_phones_and_bert("Warmup text.", "en", self.hps.model.version)
+            phones, bert, _ = self.get_phones_and_bert("Warmup text.", "en", self.hps.model.version)
             _ = self.get_phones_and_bert("你好，预热文本。", "zh", self.hps.model.version)
+
+            # Warmup GPT and SoVITS
+            print("Warming up GPU kernels...")
+            with torch.no_grad():
+                # Dummy GPT input
+                dummy_prompt = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+                dummy_bert = torch.zeros((1, 1024, len(phones) + 1), dtype=torch.float16 if self.is_half else torch.float32, device=self.device)
+                dummy_phones = torch.LongTensor(phones + [0]).unsqueeze(0).to(self.device)
+                dummy_phones_len = torch.tensor([dummy_phones.shape[-1]]).to(self.device)
+                
+                # GPT warmup
+                pred_semantic, idx = self.t2s_model.model.infer_panel(
+                    dummy_phones, dummy_phones_len, dummy_prompt, dummy_bert,
+                    top_k=5, top_p=1, temperature=1, early_stop_num=50
+                )
+                
+                # Dummy SoVITS input
+                dummy_spec = torch.zeros((1, self.hps.data.filter_length // 2 + 1, 10), device=self.device)
+                if self.is_half: dummy_spec = dummy_spec.half()
+                dummy_semantic = pred_semantic[:, -idx:].unsqueeze(0)
+                
+                # SoVITS warmup
+                _ = self.vq_model.decode(
+                    dummy_semantic,
+                    torch.LongTensor(phones).unsqueeze(0).to(self.device),
+                    [dummy_spec]
+                )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print("Warmup completed.")
         except Exception as e:
             print(f"Warmup failed (non-critical): {e}")
 
@@ -290,6 +320,7 @@ class GPTSoVITSInference:
 
         print(f"Inferencing: {text} ({text_lang})")
         
+        if self.device == "cuda": torch.cuda.synchronize()
         t_all_start = time.perf_counter()
         segments = split_text(text)
         if not segments:
@@ -328,11 +359,14 @@ class GPTSoVITSInference:
 
         # Process Reference Text (Once)
         phones1, bert1, norm_text1 = self.get_phones_and_bert(prompt_text, prompt_lang, self.hps.model.version)
+        if self.device == "cuda": torch.cuda.synchronize()
         t_ref_end = time.perf_counter()
 
         total_text_time = 0
         total_gpt_time = 0
         total_sovits_time = 0
+        t_first_segment = 0
+        total_gpt_tokens = 0
 
         for i, seg in enumerate(segments):
             print(f"Processing segment {i+1}/{len(segments)}: {seg}")
@@ -340,6 +374,7 @@ class GPTSoVITSInference:
             # Process Text Segment
             t_seg_text_start = time.perf_counter()
             phones2, bert2, norm_text2 = self.get_phones_and_bert(seg, text_lang, self.hps.model.version)
+            if self.device == "cuda": torch.cuda.synchronize()
             t_seg_text_end = time.perf_counter()
             total_text_time += (t_seg_text_end - t_seg_text_start)
 
@@ -361,8 +396,10 @@ class GPTSoVITSInference:
                     early_stop_num=50 * 30  # max_sec
                 )
                 pred_semantic = pred_semantic[:, -idx:].unsqueeze(0)
+            if self.device == "cuda": torch.cuda.synchronize()
             t_gpt_end = time.perf_counter()
             total_gpt_time += (t_gpt_end - t_gpt_start)
+            total_gpt_tokens += idx
 
             # SoVITS Decoding
             t_sovits_start = time.perf_counter()
@@ -375,21 +412,36 @@ class GPTSoVITSInference:
                     speed=speed,
                     sv_emb=[sv_emb]  # List of sv_embs
                 )[0][0]
+            if self.device == "cuda": torch.cuda.synchronize()
             t_sovits_end = time.perf_counter()
             total_sovits_time += (t_sovits_end - t_sovits_start)
                 
-            final_audios.append(audio.cpu().float().numpy())
+            audio_np = audio.cpu().float().numpy()
+            final_audios.append(audio_np)
+            
+            if i == 0:
+                t_first_segment = time.perf_counter() - t_all_start
+
             if i < len(segments) - 1 and pause_length > 0:
                 final_audios.append(np.zeros(int(sr * pause_length)))
 
         t_all_end = time.perf_counter()
         
+        # Performance Summary
+        total_audio_duration = sum(len(a) for a in final_audios) / sr
+        total_inference_time = t_all_end - t_all_start
+        rtf = total_inference_time / total_audio_duration if total_audio_duration > 0 else 0
+        gpt_tps = total_gpt_tokens / total_gpt_time if total_gpt_time > 0 else 0
+
         print(f"\n--- Inference Performance Summary ---")
         print(f"Reference Processing:  {t_ref_end - t_ref_start:.3f}s")
         print(f"Target Text Cleaning:  {total_text_time:.3f}s")
-        print(f"GPT Semantic Gen:      {total_gpt_time:.3f}s")
+        print(f"GPT Semantic Gen:      {total_gpt_time:.3f}s ({gpt_tps:.2f} tokens/s)")
         print(f"SoVITS Audio Decode:   {total_sovits_time:.3f}s")
-        print(f"Total Inference Time:  {t_all_end - t_all_start:.3f}s")
+        print(f"First Segment Latency: {t_first_segment:.3f}s")
+        print(f"Total Audio Duration:  {total_audio_duration:.3f}s")
+        print(f"Total Inference Time:  {total_inference_time:.3f}s")
+        print(f"Real Time Factor (RTF): {rtf:.4f}")
         print(f"-------------------------------------\n")
 
         return np.concatenate(final_audios), sr

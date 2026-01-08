@@ -339,7 +339,8 @@ class GPTSoVITS_ONNX_Inference:
         t_gpt_enc = 0.0
         t_gpt_dec = 0.0
         t_sovits = 0.0
-        steps = 0
+        t_first_segment = 0.0
+        total_steps = 0
 
         t_total_start = time.perf_counter()
 
@@ -351,8 +352,6 @@ class GPTSoVITS_ONNX_Inference:
         wav16k_padded = np.concatenate([wav16k, zero_wav])[None, :]
 
         ssl_content = self.run_sess(self.sess_ssl, {"audio": wav16k_padded})[0]
-        # ssl_content is now [1, 768, T] from the updated ONNX export
-        
         codes = self.run_sess(self.sess_vq, {"ssl_content": ssl_content})[0]
         prompt_semantic = codes[0, 0][None, :]
         t_ref_audio = time.perf_counter() - t_start
@@ -386,29 +385,29 @@ class GPTSoVITS_ONNX_Inference:
 
         for seg_idx, seg in enumerate(segments):
             print(f"Processing segment {seg_idx+1}/{len(segments)}: {seg}")
-            t_start = time.perf_counter()
+            
+            # Text Segment
+            t_seg_start = time.perf_counter()
             phones2, bert2, norm_text2 = self.get_phones_and_bert(seg, text_lang, self.version)
-
             bert = np.concatenate([bert1, bert2], axis=1)[None, :, :].astype(self.precision)
-
             all_phoneme_ids = np.array(phones1 + phones2, dtype=np.int64)[None, :]
             all_phoneme_len = np.array([all_phoneme_ids.shape[1]], dtype=np.int64)
-            t_text_proc += time.perf_counter() - t_start
+            t_text_proc += time.perf_counter() - t_seg_start
 
             # GPT Encoder
-            t_start = time.perf_counter()
+            t_enc_start = time.perf_counter()
             topk_values, topk_indices, k_cache, v_cache, x_len, y_len = self.run_sess(self.sess_gpt_enc, {
                 "phoneme_ids": all_phoneme_ids,
                 "phoneme_ids_len": all_phoneme_len,
                 "prompts": prompt_semantic.astype(np.int64),
                 "bert_feature": bert
             })
-            t_gpt_enc += time.perf_counter() - t_start
+            t_gpt_enc += time.perf_counter() - t_enc_start
 
             current_samples = sample_topk(topk_values, topk_indices, temperature=temperature)
             decoded_semantic_list = [prompt_semantic, current_samples]
 
-            # 4. GPT Step
+            # GPT Step
             t_dec_start = time.perf_counter()
             max_steps = 1500
             cache_dtype = np.float32
@@ -425,6 +424,7 @@ class GPTSoVITS_ONNX_Inference:
             y_len_ort = onnxruntime.OrtValue.ortvalue_from_numpy(y_len.astype(np.int64))
             io_binding = self.step_io_binding
 
+            seg_steps = 0
             for i in range(max_steps):
                 src_cache = caches[i % 2]
                 dst_cache = caches[(i + 1) % 2]
@@ -446,10 +446,11 @@ class GPTSoVITS_ONNX_Inference:
                 topk_indices = outputs[1].numpy()
                 current_samples = sample_topk(topk_values, topk_indices, temperature=temperature)
                 decoded_semantic_list.append(current_samples)
-                steps += 1
+                seg_steps += 1
                 if current_samples[0, 0] == 1024:
                     break
             t_gpt_dec += time.perf_counter() - t_dec_start
+            total_steps += seg_steps
 
             pred_semantic = np.concatenate(decoded_semantic_list, axis=1)
             generated_sem = pred_semantic[:, prompt_semantic.shape[1]:]
@@ -457,7 +458,7 @@ class GPTSoVITS_ONNX_Inference:
             generated_sem = generated_sem[:, None, :]
 
             # 5. SoVITS
-            t_start = time.perf_counter()
+            t_sov_start = time.perf_counter()
             audio = self.run_sess(self.sess_sovits, {
                 "pred_semantic": generated_sem.astype(np.int64),
                 "text_seq": np.array(phones2, dtype=np.int64)[None, :],
@@ -466,9 +467,14 @@ class GPTSoVITS_ONNX_Inference:
                 "noise_scale": np.array([noise_scale], dtype=np.float32),
                 "speed": np.array([speed], dtype=np.float32),
             })[0]
-            t_sovits += time.perf_counter() - t_start
+            t_sovits += time.perf_counter() - t_sov_start
             
-            final_audios.append(audio.squeeze())
+            audio_np = audio.squeeze()
+            final_audios.append(audio_np)
+            
+            if seg_idx == 0:
+                t_first_segment = time.perf_counter() - t_total_start
+
             if seg_idx < len(segments) - 1 and pause_length > 0:
                 final_audios.append(np.zeros(int(sr * pause_length)))
 
@@ -476,17 +482,23 @@ class GPTSoVITS_ONNX_Inference:
         
         full_audio = np.concatenate(final_audios).astype(np.float32)
         sf.write(output_path, full_audio, sr)
-        print(f"write {output_path}")
-        # Report
-        t_step_avg = t_gpt_dec / steps if steps > 0 else 0.0
-        print("\n--- Inference Timings (Warmed Up) ---")
-        print(f"Ref Audio (SSL+VQ):   {t_ref_audio:.4f}s")
-        print(f"Text (Cleaning+BERT): {t_text_proc:.4f}s")
-        print(f"GPT Encoder:          {t_gpt_enc:.4f}s")
-        print(f"GPT Decoding:         {t_gpt_dec:.4f}s ({steps} steps, {t_step_avg:.5f}s/step, {1/t_step_avg:.2f}step/s)")
-        print(f"SoVITS Decoder:       {t_sovits:.4f}s")
-        print(f"Total Time:           {t_total:.4f}s")
-        print("-------------------------------------")
+        print(f"Saved audio to {output_path}")
+
+        # Performance Summary
+        total_audio_duration = len(full_audio) / sr
+        rtf = t_total / total_audio_duration if total_audio_duration > 0 else 0
+        gpt_tps = total_steps / t_gpt_dec if t_gpt_dec > 0 else 0
+
+        print("\n--- Inference Performance Summary (ONNX) ---")
+        print(f"Reference Processing:  {t_ref_audio:.3f}s")
+        print(f"Target Text Cleaning:  {t_text_proc:.3f}s")
+        print(f"GPT Semantic Gen:      {t_gpt_enc + t_gpt_dec:.3f}s ({gpt_tps:.2f} tokens/s)")
+        print(f"SoVITS Audio Decode:   {t_sovits:.3f}s")
+        print(f"First Segment Latency: {t_first_segment:.3f}s")
+        print(f"Total Audio Duration:  {total_audio_duration:.3f}s")
+        print(f"Total Inference Time:  {t_total:.3f}s")
+        print(f"Real Time Factor (RTF): {rtf:.4f}")
+        print("-------------------------------------------\n")
 
 
 if __name__ == "__main__":
