@@ -50,7 +50,8 @@ def split_text(text):
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
 def sample_topk(topk_values, topk_indices, temperature=1.0):
-    # Optimized: Keep everything on GPU to avoid CPU synchronization
+    # Support both CPU and GPU tensors
+    device = topk_values.device
     if temperature != 1.0:
         topk_values = topk_values / temperature
     
@@ -58,8 +59,14 @@ def sample_topk(topk_values, topk_indices, temperature=1.0):
     probs = torch.softmax(topk_values, dim=-1)
     
     # Sample using multinomial
-    indices_of_indices = torch.multinomial(probs, num_samples=1) # [B, 1]
-    samples = torch.gather(topk_indices, -1, indices_of_indices) # [B, 1]
+    # For small sizes (K=50), CPU is often faster on Windows due to launch overhead
+    if device.type == "cuda":
+        # Multinomial is a sync point anyway if we inspect it
+        indices_of_indices = torch.multinomial(probs, num_samples=1)
+    else:
+        indices_of_indices = torch.multinomial(probs, num_samples=1)
+        
+    samples = torch.gather(topk_indices, -1, indices_of_indices)
     
     return samples
 
@@ -73,9 +80,9 @@ def trt_dtype_to_torch(trt_dtype):
     return torch.float32
 
 class TRTModule:
-    def __init__(self, engine_path, device="cuda"):
+    def __init__(self, engine_path, device="cuda", stream=None):
         self.device = torch.device(device)
-        self.stream = torch.cuda.Stream(device=self.device)
+        self.stream = stream if stream is not None else torch.cuda.Stream(device=self.device)
         # Use shared global logger
         with open(engine_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
             self.engine = runtime.deserialize_cuda_engine(f.read())
@@ -86,6 +93,7 @@ class TRTModule:
         self.output_tensors = {}
         self.is_dynamic = {}
         self.tensor_location = {}
+        self.tensor_dtype = {}
         
         try:
             self.num_io = self.engine.num_io_tensors
@@ -101,11 +109,13 @@ class TRTModule:
                 shape = self.engine.get_tensor_shape(name)
                 self.is_dynamic[name] = any(d < 0 for d in shape)
                 self.tensor_location[name] = self.engine.get_tensor_location(name)
+                self.tensor_dtype[name] = trt_dtype_to_torch(self.engine.get_tensor_dtype(name))
             else:
                 name = self.engine.get_binding_name(i)
                 is_input = self.engine.binding_is_input(i)
                 self.is_dynamic[name] = self.engine.binding_is_variable(i) if hasattr(self.engine, "binding_is_variable") else True
                 self.tensor_location[name] = trt.TensorLocation.DEVICE
+                self.tensor_dtype[name] = trt_dtype_to_torch(self.engine.get_binding_dtype(i))
             
             if is_input:
                 self.input_names.append(name)
@@ -114,7 +124,7 @@ class TRTModule:
         
         print(f"  - Loaded {os.path.basename(engine_path)}: Inputs={self.input_names}, Outputs={self.output_names}")
 
-    def __call__(self, inputs, outputs=None):
+    def __call__(self, inputs, outputs=None, sync=True):
         bindings = [None] * (self.engine.num_bindings if not self.use_new_api else self.num_io)
         held_tensors = [] # Keep references
         
@@ -125,12 +135,7 @@ class TRTModule:
             tensor = inputs[name]
             
             # Auto-cast dtype if necessary
-            idx_io = self.engine.get_binding_index(name) if not self.use_new_api else -1
-            if self.use_new_api:
-                target_dtype = trt_dtype_to_torch(self.engine.get_tensor_dtype(name))
-            else:
-                target_dtype = trt_dtype_to_torch(self.engine.get_binding_dtype(idx_io))
-            
+            target_dtype = self.tensor_dtype[name]
             if tensor.dtype != target_dtype:
                 tensor = tensor.to(target_dtype)
             
@@ -148,6 +153,7 @@ class TRTModule:
                     self.context.set_input_shape(name, tensor.shape)
                 self.context.set_tensor_address(name, tensor.data_ptr())
             else:
+                idx_io = self.engine.get_binding_index(name)
                 if self.is_dynamic[name]:
                     self.context.set_binding_shape(idx_io, tensor.shape)
                 bindings[idx_io] = tensor.data_ptr()
@@ -163,10 +169,9 @@ class TRTModule:
                 shape = self.context.get_tensor_shape(name)
                 if name not in outputs:
                     if name not in self.output_tensors or tuple(self.output_tensors[name].shape) != tuple(shape):
-                        dtype = self.engine.get_tensor_dtype(name)
                         # Allocation must match required location
                         out_device = "cpu" if target_loc == trt.TensorLocation.HOST else self.device
-                        self.output_tensors[name] = torch.empty(tuple(shape), dtype=trt_dtype_to_torch(dtype), device=out_device)
+                        self.output_tensors[name] = torch.empty(tuple(shape), dtype=self.tensor_dtype[name], device=out_device)
                     outputs[name] = self.output_tensors[name]
                 
                 output_tensor = outputs[name]
@@ -176,8 +181,7 @@ class TRTModule:
                 shape = self.context.get_binding_shape(idx)
                 if name not in outputs:
                     if name not in self.output_tensors or tuple(self.output_tensors[name].shape) != tuple(shape):
-                        dtype = self.engine.get_binding_dtype(idx)
-                        self.output_tensors[name] = torch.empty(tuple(shape), dtype=trt_dtype_to_torch(dtype), device=self.device)
+                        self.output_tensors[name] = torch.empty(tuple(shape), dtype=self.tensor_dtype[name], device=self.device)
                     outputs[name] = self.output_tensors[name]
                 
                 output_tensor = outputs[name]
@@ -193,7 +197,9 @@ class TRTModule:
                 self.context.execute_async_v2(bindings, self.stream.cuda_stream)
             else:
                 self.context.execute_v2(bindings)
-            self.stream.synchronize()
+            
+            if sync:
+                self.stream.synchronize()
         except Exception as e:
             print(f"Error during TRT execution: {e}")
             raise e
@@ -203,15 +209,16 @@ class TRTModule:
 class GPTSoVITS_TRT_Inference:
     def __init__(self, trt_dir, bert_path, sovits_path, device="cuda"):
         self.trt_dir = trt_dir
-        self.device = device
+        self.device = torch.device(device)
+        self.stream = torch.cuda.Stream(device=self.device)
         
         print(f"Loading TensorRT engines from {trt_dir} on {device}...")
-        self.model_ssl = TRTModule(f"{trt_dir}/ssl.engine", device)
-        self.model_bert = TRTModule(f"{trt_dir}/bert.engine", device)
-        self.model_vq = TRTModule(f"{trt_dir}/vq_encoder.engine", device)
-        self.model_gpt_enc = TRTModule(f"{trt_dir}/gpt_encoder.engine", device)
-        self.model_gpt_step = TRTModule(f"{trt_dir}/gpt_step.engine", device)
-        self.model_sovits = TRTModule(f"{trt_dir}/sovits.engine", device)
+        self.model_ssl = TRTModule(f"{trt_dir}/ssl.engine", device, self.stream)
+        self.model_bert = TRTModule(f"{trt_dir}/bert.engine", device, self.stream)
+        self.model_vq = TRTModule(f"{trt_dir}/vq_encoder.engine", device, self.stream)
+        self.model_gpt_enc = TRTModule(f"{trt_dir}/gpt_encoder.engine", device, self.stream)
+        self.model_gpt_step = TRTModule(f"{trt_dir}/gpt_step.engine", device, self.stream)
+        self.model_sovits = TRTModule(f"{trt_dir}/sovits.engine", device, self.stream)
 
         self.tokenizer = AutoTokenizer.from_pretrained(bert_path)
         
@@ -227,14 +234,15 @@ class GPTSoVITS_TRT_Inference:
         self.sv_model = SV(device, False)
 
         # Detect precision from gpt_encoder engine as a proxy
-        if self.model_gpt_enc.use_new_api:
-            dtype = self.model_gpt_enc.engine.get_tensor_dtype("bert_feature")
-        else:
-            idx = self.model_gpt_enc.engine.get_binding_index("bert_feature")
-            dtype = self.model_gpt_enc.engine.get_binding_dtype(idx)
+        gpt_enc_dtype = self.model_gpt_enc.tensor_dtype["bert_feature"]
+        sovits_dtype = self.model_sovits.tensor_dtype["refer_spec"]
         
-        self.precision = torch.float16 if dtype == trt.DataType.HALF else torch.float32
-        print(f"Detected engine precision: {self.precision}")
+        print(f"Engine precision detection:")
+        print(f"  - GPT Encoder (bert_feature): {gpt_enc_dtype}")
+        print(f"  - SoVITS (refer_spec): {sovits_dtype}")
+
+        self.precision = gpt_enc_dtype
+        print(f"Using {self.precision} for inference.")
 
         self.warmup()
 
@@ -392,9 +400,10 @@ class GPTSoVITS_TRT_Inference:
 
         t_total_start = time.perf_counter()
 
-        # Audio
-        t_start = time.perf_counter()
-        wav16k, _ = librosa.load(ref_wav_path, sr=16000)
+        with torch.cuda.stream(self.stream):
+            # Audio
+            t_start = time.perf_counter()
+            wav16k, _ = librosa.load(ref_wav_path, sr=16000)
         wav16k = torch.from_numpy(wav16k).to(self.device).to(self.precision)
         zero_wav = torch.zeros(int(16000 * 0.3), device=self.device, dtype=self.precision)
         wav16k_padded = torch.cat([wav16k, zero_wav])[None, :]
@@ -457,15 +466,18 @@ class GPTSoVITS_TRT_Inference:
             })
             t_gpt_enc += time.perf_counter() - t_start
             
-            topk_values = gpt_enc_out["topk_values"]
-            topk_indices = gpt_enc_out["topk_indices"]
+            # Use CPU sampling for consistency and to avoid sync issues in the loop
+            topk_values = gpt_enc_out["topk_values"].detach().cpu()
+            topk_indices = gpt_enc_out["topk_indices"].detach().cpu()
             k_cache = gpt_enc_out["k_cache"]
             v_cache = gpt_enc_out["v_cache"]
             x_len = gpt_enc_out["x_len"]
             y_len = gpt_enc_out["y_len"]
 
-            current_samples = sample_topk(topk_values, topk_indices, temperature=temperature)
-            decoded_semantic_list = [prompt_semantic, current_samples]
+            current_samples = sample_topk(topk_values, topk_indices, temperature=temperature).to(self.device)
+            # Ensure prompt_semantic is on the same device as generated samples
+            prompt_semantic_gpu = prompt_semantic.to(self.device)
+            decoded_semantic_list = [prompt_semantic_gpu, current_samples]
 
             # GPT Step
             t_dec_start = time.perf_counter()
@@ -473,8 +485,6 @@ class GPTSoVITS_TRT_Inference:
             kv_max_len = k_cache.shape[2]
             
             # The number of tokens already in the cache (prompt + reference)
-            # x_len + y_len tokens are at indices 0 to (x_len + y_len - 1)
-            # The first generated token (current_samples) will be at index (x_len + y_len)
             base_len = int(x_len.item() + y_len.item())
             max_gen_len = kv_max_len - base_len - 1
             if max_gen_len <= 0:
@@ -489,36 +499,58 @@ class GPTSoVITS_TRT_Inference:
             k_cache_1 = torch.zeros_like(k_cache_0)
             v_cache_1 = torch.zeros_like(v_cache_0)
             
-            # Pre-move indexing tensors to CPU as they are likely shape tensors
-            x_len_cpu = x_len.detach().cpu().to(torch.int64)
-            y_len_cpu = y_len.detach().cpu().to(torch.int64)
+            # Pre-move indexing tensors to correct device
+            def prepare_tensor(name, tensor, module):
+                target_loc = module.tensor_location.get(name, trt.TensorLocation.DEVICE)
+                if target_loc == trt.TensorLocation.HOST:
+                    return tensor.detach().cpu().to(torch.int64)
+                else:
+                    return tensor.detach().to(self.device).to(torch.int64)
+
+            x_len_opt = prepare_tensor("x_len", x_len, self.model_gpt_step)
+            y_len_opt = prepare_tensor("y_len", y_len, self.model_gpt_step)
             
             caches = [(k_cache_0, v_cache_0), (k_cache_1, v_cache_1)]
             
             seg_steps = 0
+            # Pre-allocate indices on correct device
+            idx_loc = self.model_gpt_step.tensor_location.get("idx", trt.TensorLocation.DEVICE)
+            idx_device = "cpu" if idx_loc == trt.TensorLocation.HOST else self.device
+            idx_tensors = [torch.tensor([i], dtype=torch.int64, device=idx_device) for i in range(max_steps)]
+            
+            # Optimization: Pre-bind unchanging outputs to avoid dict creation
+            step_outputs = {"k_cache_new": None, "v_cache_new": None}
+
             for i in range(max_steps):
-                # idx MUST be CPU for shape tensors in many TRT engines
-                idx_tensor = torch.tensor([i], dtype=torch.int64, device="cpu")
+                idx_tensor = idx_tensors[i]
                 
                 src_cache = caches[i % 2]
                 dst_cache = caches[(i + 1) % 2]
+                step_outputs["k_cache_new"] = dst_cache[0]
+                step_outputs["v_cache_new"] = dst_cache[1]
                 
+                # Execute WITHOUT explicit stream sync inside TRTModule
                 step_out = self.model_gpt_step({
                     "samples": current_samples.to(torch.int64),
                     "k_cache": src_cache[0],
                     "v_cache": src_cache[1],
                     "idx": idx_tensor,
-                    "x_len": x_len_cpu,
-                    "y_len": y_len_cpu
-                }, outputs={
-                    "k_cache_new": dst_cache[0],
-                    "v_cache_new": dst_cache[1]
-                })
+                    "x_len": x_len_opt,
+                    "y_len": y_len_opt
+                }, outputs=step_outputs, sync=False)
                 
-                topk_values = step_out["topk_values"]
-                topk_indices = step_out["topk_indices"]
+                # We need topk_values and topk_indices on CPU for break check and sampling (to match ONNX speed)
+                # This access will trigger an implicit synchronization for these specific tensors
+                topk_v = step_out["topk_values"].detach().cpu()
+                topk_i = step_out["topk_indices"].detach().cpu()
                 
-                current_samples = sample_topk(topk_values, topk_indices, temperature=temperature)
+                # CPU sampling (often faster for small N=50 than GPU launch overhead + sync)
+                if temperature != 1.0:
+                    topk_v = topk_v / temperature
+                probs = torch.softmax(topk_v, dim=-1)
+                indices_of_indices = torch.multinomial(probs, num_samples=1)
+                current_samples = torch.gather(topk_i, -1, indices_of_indices).to(self.device)
+                
                 decoded_semantic_list.append(current_samples)
                 seg_steps += 1
                 
