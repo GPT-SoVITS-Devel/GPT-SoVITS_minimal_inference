@@ -548,6 +548,8 @@ class GPTSoVITS_TRT_Inference:
                 t_sovits += time.perf_counter() - t_sov_start
                 
                 audio_np = audio.squeeze().detach().cpu().numpy()
+                # Remove DC offset per segment to prevent drift
+                audio_np = audio_np - np.mean(audio_np)
                 final_audios.append(audio_np)
                 
                 if seg_idx == 0:
@@ -559,6 +561,12 @@ class GPTSoVITS_TRT_Inference:
         t_total = time.perf_counter() - t_total_start
         
         full_audio = np.concatenate(final_audios).astype(np.float32)
+        
+        # Global Peak Normalization
+        max_amp = np.abs(full_audio).max()
+        if max_amp > 1e-5:
+            full_audio = full_audio / max_amp * 0.9
+            
         sf.write(output_path, full_audio, sr)
         print(f"Saved audio to {output_path}")
 

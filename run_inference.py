@@ -184,7 +184,9 @@ class GPTSoVITSInference:
                 # Dummy SoVITS input
                 dummy_spec = torch.zeros((1, self.hps.data.filter_length // 2 + 1, 10), device=self.device)
                 if self.is_half: dummy_spec = dummy_spec.half()
-                dummy_semantic = pred_semantic[:, -idx:].unsqueeze(0)
+                # Correct slicing for warmup as well
+                dummy_prefix_len = dummy_prompt.shape[1]
+                dummy_semantic = pred_semantic[:, dummy_prefix_len:].unsqueeze(0)
                 
                 # SoVITS warmup
                 _ = self.vq_model.decode(
@@ -331,8 +333,9 @@ class GPTSoVITSInference:
 
         # Process Reference
         t_ref_start = time.perf_counter()
-        zero_wav = torch.zeros(
-            int(self.hps.data.sampling_rate * 0.3),
+        # Use 16kHz for zero_wav to match wav16k sampling rate
+        zero_wav_16k = torch.zeros(
+            int(16000 * 0.3),
             dtype=torch.float16 if self.is_half else torch.float32
         ).to(self.device)
 
@@ -342,7 +345,7 @@ class GPTSoVITSInference:
             if self.is_half: wav16k = wav16k.half()
 
             # Extract SSL
-            wav16k = torch.cat([wav16k, zero_wav])
+            wav16k = torch.cat([wav16k, zero_wav_16k])
             ssl_content = self.ssl_model.model(wav16k.unsqueeze(0))["last_hidden_state"].transpose(1, 2)
             codes = self.vq_model.extract_latent(ssl_content)
             prompt_semantic = codes[0, 0]
@@ -395,7 +398,9 @@ class GPTSoVITSInference:
                     temperature=temperature,
                     early_stop_num=50 * 30  # max_sec
                 )
-                pred_semantic = pred_semantic[:, -idx:].unsqueeze(0)
+                # Correct slicing: take only the generated tokens after the prompt
+                prefix_len = prompt.shape[1]
+                pred_semantic = pred_semantic[:, prefix_len:].unsqueeze(0)
             if self.device == "cuda": torch.cuda.synchronize()
             t_gpt_end = time.perf_counter()
             total_gpt_time += (t_gpt_end - t_gpt_start)
@@ -417,6 +422,8 @@ class GPTSoVITSInference:
             total_sovits_time += (t_sovits_end - t_sovits_start)
                 
             audio_np = audio.cpu().float().numpy()
+            # Remove DC offset per segment to prevent drift
+            audio_np = audio_np - np.mean(audio_np)
             final_audios.append(audio_np)
             
             if i == 0:
@@ -427,8 +434,15 @@ class GPTSoVITSInference:
 
         t_all_end = time.perf_counter()
         
+        # Final Audio Post-processing
+        audio_final = np.concatenate(final_audios)
+        # Peak normalization to ensure consistent volume
+        max_amp = np.abs(audio_final).max()
+        if max_amp > 1e-5:
+            audio_final = audio_final / max_amp * 0.9
+
         # Performance Summary
-        total_audio_duration = sum(len(a) for a in final_audios) / sr
+        total_audio_duration = len(audio_final) / sr
         total_inference_time = t_all_end - t_all_start
         rtf = total_inference_time / total_audio_duration if total_audio_duration > 0 else 0
         gpt_tps = total_gpt_tokens / total_gpt_time if total_gpt_time > 0 else 0
@@ -444,7 +458,7 @@ class GPTSoVITSInference:
         print(f"Real Time Factor (RTF): {rtf:.4f}")
         print(f"-------------------------------------\n")
 
-        return np.concatenate(final_audios), sr
+        return audio_final, sr
 
 
 if __name__ == "__main__":

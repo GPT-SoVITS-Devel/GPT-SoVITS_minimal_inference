@@ -329,7 +329,10 @@ class GPTSoVITSLongInference:
                     
                     h_samples = min(hist.shape[1] if hist is not None else 0, h_len) * samples_per_token
                     c_samples = tokens.shape[1] * samples_per_token
-                    return audio[0, 0].cpu().float().numpy()[h_samples : h_samples + c_samples]
+                    audio_np = audio[0, 0].cpu().float().numpy()[h_samples : h_samples + c_samples]
+                    # DC offset removal for this chunk
+                    audio_np = audio_np - np.mean(audio_np)
+                    return audio_np
 
                 for chunk, is_last in token_generator:
                     if chunk is not None:
@@ -478,5 +481,11 @@ if __name__ == "__main__":
             full_audio.append(audio_chunk)
         
         if full_audio:
-            sf.write(args.output, np.concatenate(full_audio), inference.hps.data.sampling_rate)
+            full_audio_np = np.concatenate(full_audio)
+            # Global peak normalization
+            max_amp = np.abs(full_audio_np).max()
+            if max_amp > 1e-5:
+                full_audio_np = full_audio_np / max_amp * 0.9
+            
+            sf.write(args.output, full_audio_np, inference.hps.data.sampling_rate)
             print(f"Saved to {args.output}")
