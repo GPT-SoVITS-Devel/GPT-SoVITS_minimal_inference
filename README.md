@@ -85,9 +85,11 @@ Original **Lookahead + History Window** mechanism:
 
 ```bash
 python export_onnx.py \
-    --gpt_path "weights/gpt.ckpt" \
-    --sovits_path "weights/sovits.pth" \
-    --output_dir "onnx_export/optimized" \
+    --gpt_path "pretrained_models\GPT_weights_v2ProPlus/firefly_v2_pp-e25.ckpt"
+    --sovits_path "pretrained_models\SoVITS_weights_v2ProPlus/firefly_v2_pp_e10_s590.pth"
+    --cnhubert_base_path pretrained_models\chinese-hubert-base
+    --bert_path pretrained_models\chinese-roberta-wwm-ext-large
+    --output_dir  "onnx_export/firefly_v2_proplus"
     --max_len 1000
 ```
 
@@ -95,21 +97,35 @@ python export_onnx.py \
 
 ```bash
 python onnx_to_fp16.py \
-    --input_dir "onnx_export/optimized" \
-    --output_dir "onnx_export/optimized_fp16"
+    --input_dir "onnx_export/firefly_v2_proplus" \
+    --output_dir "onnx_export/firefly_v2_proplus_fp16"
 ```
 
 ### 3. Run High-Performance Inference
 
 ```bash
 # Pure streaming inference
-python run_onnx_streaming_inference.py --onnx_dir "onnx_export/optimized_fp16" --text "Hello, this is a high-speed test."
+python run_onnx_streaming_inference.py \
+    --onnx_dir onnx_export/firefly_v2_proplus_fp16 \
+    --ref_audio "pretrained_models\看，这尊雕像就是匹诺康尼大名鼎鼎的卡通人物钟表小子.wav" \
+    --ref_text "看，这尊雕像就是匹诺康尼大名鼎鼎的卡通人物“钟表小子" \
+    --ref_lang "zh" \
+    --text "范肖有一项奇特的能力，可以把自己的运气像钱一样攒起来用。攒的越多，越能撞大运。比如攒一个月，就能中彩票。那么，攒到极限会发生什么呢？"
+     --lang "zh" --output "out_onnx_stream.wav"
 
 # Launch full-featured WebUI
-python run_optimized_inference.py --webui
+python run_optimized_inference.py --onnx_dir onnx_export/firefly_v2_proplus_fp16 --webui
 ```
 
-### 4. Export TensorRT Engine
+### ONNX optimize FP16
+
+```bash
+# onnx下对fp16的加速不太明显,但是对显存优化拥有极大好处
+python onnx_to_fp16.py --input_dir "onnx_export/firefly_v2_proplus" \
+  --output_dir "onnx_export/firefly_v2_proplus_fp16"
+```
+
+### Export TensorRT Engine
 
 > Note: Compiling TRT engines takes time and must be done for each specific hardware/CUDA/TRT version combination.
 
