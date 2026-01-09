@@ -3,7 +3,11 @@
 # ⚡ GPT-SoVITS Minimal Inference
 **High-Performance | Production-Ready | Zero-Copy Pipeline**
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Python](https://img.shields.io/badge/python-3.9+-green.svg)](https://www.python.org/) [![GPU](https://img.shields.io/badge/CUDA-11.8+-orange.svg)](https://developer.nvidia.com/cuda-zone) [![ONNX](https://img.shields.io/badge/ONNX-Optimized-brightgreen.svg)](https://onnxruntime.ai/) [![TensorRT](https://img.shields.io/badge/TensorRT-Enabled-76B900.svg)](https://developer.nvidia.com/tensorrt) 
+[![License](https://img.shields.io/badge/license-apache-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/)
+[![GPU](https://img.shields.io/badge/CUDA-12.6+-orange.svg)](https://developer.nvidia.com/cuda-zone)
+[![ONNX](https://img.shields.io/badge/ONNX-Optimized-brightgreen.svg)](https://onnxruntime.ai/)
+[![TensorRT](https://img.shields.io/badge/TensorRT-Enabled-76B900.svg)](https://developer.nvidia.com/tensorrt)
 
 [简体中文](./README_zh.md) | [English](./README.md)
 
