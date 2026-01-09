@@ -8,6 +8,7 @@ import time
 import librosa
 import soundfile as sf
 import re
+import json
 from transformers import AutoTokenizer
 
 # Setup paths
@@ -59,7 +60,7 @@ def sample_topk(topk_values, topk_indices, temperature=1.0):
     return np.array(samples, dtype=np.int64)[:, None]
 
 class GPTSoVITS_ONNX_Streaming_Inference:
-    def __init__(self, onnx_dir, bert_path, sovits_path, device="cpu"):
+    def __init__(self, onnx_dir, bert_path, device="cpu"):
         self.onnx_dir = onnx_dir
         self.device = device
         self.providers = [("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"] if device == "cuda" else ["CPUExecutionProvider"]
@@ -75,15 +76,16 @@ class GPTSoVITS_ONNX_Streaming_Inference:
         self.sess_sovits = onnxruntime.InferenceSession(f"{onnx_dir}/sovits.onnx", sess_options=so, providers=self.providers)
         
         self.tokenizer = AutoTokenizer.from_pretrained(bert_path)
-        from GPT_SoVITS.process_ckpt import load_sovits_new, get_sovits_version_from_path_fast
-        dict_s2 = load_sovits_new(sovits_path)
-        self.hps = dict_s2["config"]
-        _, model_version, _ = get_sovits_version_from_path_fast(sovits_path)
-        if "config" in dict_s2 and "model" in dict_s2["config"] and "version" in dict_s2["config"]["model"]:
-            model_version = dict_s2["config"]["model"]["version"]
-        elif "sv_emb.weight" in dict_s2["weight"]:
-            model_version = "v2Pro"
-        self.version = model_version
+        
+        # Load Config for Native ONNX Inference
+        config_path = f"{onnx_dir}/config.json"
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config file not found: {config_path}. Please export ONNX with the latest export_onnx.py.")
+        
+        with open(config_path, "r", encoding="utf-8") as f:
+            self.hps = json.load(f)
+        
+        self.version = self.hps.get("model", {}).get("version", "v2")
         print(f"Detected SoVITS model version: {self.version}")
         self.sv_model = SV(device, False)
 
@@ -457,8 +459,6 @@ class GPTSoVITS_ONNX_Streaming_Inference:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--onnx_dir", default="onnx_export/firefly_v2_proplus_fp16")
-    parser.add_argument("--gpt_path", required=True)
-    parser.add_argument("--sovits_path", required=True)
     parser.add_argument("--ref_audio", required=True)
     parser.add_argument("--ref_text", required=True)
     parser.add_argument("--text", required=True)
@@ -469,7 +469,7 @@ if __name__ == "__main__":
     parser.add_argument("--pause_length", type=float, default=0.3)
     args = parser.parse_args()
 
-    infer = GPTSoVITS_ONNX_Streaming_Inference(args.onnx_dir, args.bert_path, args.sovits_path, device="cuda" if torch.cuda.is_available() else "cpu")
+    infer = GPTSoVITS_ONNX_Streaming_Inference(args.onnx_dir, args.bert_path, device="cuda" if torch.cuda.is_available() else "cpu")
     full_audio = []
     for chunk in infer.infer_stream(args.ref_audio, args.ref_text, args.ref_lang, args.text, args.lang, pause_length=args.pause_length):
         full_audio.append(chunk)

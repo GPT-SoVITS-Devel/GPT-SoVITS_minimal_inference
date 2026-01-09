@@ -8,6 +8,7 @@ import librosa
 import soundfile as sf
 import sys
 import time
+import json
 from transformers import AutoTokenizer
 
 # Setup paths
@@ -207,7 +208,7 @@ class TRTModule:
         return outputs
 
 class GPTSoVITS_TRT_Inference:
-    def __init__(self, trt_dir, bert_path, sovits_path, device="cuda"):
+    def __init__(self, trt_dir, bert_path, device="cuda"):
         self.trt_dir = trt_dir
         self.device = torch.device(device)
         self.stream = torch.cuda.Stream(device=self.device)
@@ -222,13 +223,17 @@ class GPTSoVITS_TRT_Inference:
 
         self.tokenizer = AutoTokenizer.from_pretrained(bert_path)
         
-        from GPT_SoVITS.process_ckpt import load_sovits_new, get_sovits_version_from_path_fast
-        dict_s2 = load_sovits_new(sovits_path)
-        self.hps = dict_s2["config"]
-        _, self.version, _ = get_sovits_version_from_path_fast(sovits_path)
+        # Load Config for Native Inference
+        config_path = f"{trt_dir}/config.json"
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config file not found: {config_path}. Please export ONNX with the latest export_onnx.py.")
+        
+        with open(config_path, "r", encoding="utf-8") as f:
+            self.hps = json.load(f)
+        
+        self.version = self.hps.get("model", {}).get("version", "v2")
         print(f"Detected model version: {self.version}")
 
-        self.hps["model"]["version"] = self.version
         self.hps["model"]["semantic_frame_rate"] = "25hz"
 
         self.sv_model = SV(device, False)
@@ -590,8 +595,6 @@ class GPTSoVITS_TRT_Inference:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--trt_dir", default="onnx_export/firefly_v2_proplus")
-    parser.add_argument("--gpt_path", required=True)
-    parser.add_argument("--sovits_path", required=True)
     parser.add_argument("--ref_audio", required=True)
     parser.add_argument("--ref_text", required=True)
     parser.add_argument("--text", required=True)
@@ -603,7 +606,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     GPTSoVITS_TRT_Inference(
-        args.trt_dir, args.bert_path, args.sovits_path
+        args.trt_dir, args.bert_path
     ).infer(
         args.ref_audio, args.ref_text, args.ref_lang, args.text, args.lang, 
         output_path=args.output, pause_length=args.pause_length

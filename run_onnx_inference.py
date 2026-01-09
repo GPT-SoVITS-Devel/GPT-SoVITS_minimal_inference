@@ -12,6 +12,7 @@ import librosa
 import soundfile as sf
 import sys
 import time
+import json
 from transformers import AutoTokenizer
 
 # os.environ["http_proxy"]='http://127.0.0.1:10809'
@@ -72,7 +73,7 @@ def sample_topk(topk_values, topk_indices, temperature=1.0):
     return np.array(samples, dtype=np.int64)[:, None]
 
 class GPTSoVITS_ONNX_Inference:
-    def __init__(self, onnx_dir, bert_path, sovits_path, device="cpu"):
+    def __init__(self, onnx_dir, bert_path, device="cpu"):
         self.onnx_dir = onnx_dir
         self.device = device
         
@@ -109,13 +110,17 @@ class GPTSoVITS_ONNX_Inference:
         # Pre-allocate IOBinding for GPT Step to reuse
         self.step_io_binding = self.sess_gpt_step.io_binding()
 
-        from GPT_SoVITS.process_ckpt import load_sovits_new, get_sovits_version_from_path_fast
-        dict_s2 = load_sovits_new(sovits_path)
-        self.hps = dict_s2["config"]
-        _, self.version, _ = get_sovits_version_from_path_fast(sovits_path)
+        # Load Config for Native ONNX Inference
+        config_path = f"{onnx_dir}/config.json"
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config file not found: {config_path}. Please export ONNX with the latest export_onnx.py.")
+        
+        with open(config_path, "r", encoding="utf-8") as f:
+            self.hps = json.load(f)
+        
+        self.version = self.hps.get("model", {}).get("version", "v2")
         print(f"Detected model version: {self.version}")
 
-        self.hps["model"]["version"] = self.version
         self.hps["model"]["semantic_frame_rate"] = "25hz"
 
         self.sv_model = SV(device, False)
@@ -512,8 +517,6 @@ class GPTSoVITS_ONNX_Inference:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--onnx_dir", default="onnx_export/firefly_v2_proplus_fp16")
-    parser.add_argument("--gpt_path", required=True)
-    parser.add_argument("--sovits_path", required=True)
     parser.add_argument("--ref_audio", required=True)
     parser.add_argument("--ref_text", required=True)
     parser.add_argument("--text", required=True)
@@ -525,7 +528,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     GPTSoVITS_ONNX_Inference(
-        args.onnx_dir, args.bert_path, args.sovits_path,
+        args.onnx_dir, args.bert_path,
         device="cuda" if torch.cuda.is_available() else "cpu"
     ).infer(
         args.ref_audio, args.ref_text, args.ref_lang, args.text, args.lang, 

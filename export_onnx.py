@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import torch
+import json
 from torch import nn
 from torch.nn import functional as F
 from GPT_SoVITS.process_ckpt import load_sovits_new, get_sovits_version_from_path_fast
@@ -118,6 +119,16 @@ class VQEncoder(nn.Module):
         codes = self.vq_model.extract_latent(ssl_content)
         # codes: [1, 1, T] (indices)
         return codes
+
+def hparams_to_dict(hp):
+    if hasattr(hp, "__dict__"):
+        return {k: hparams_to_dict(v) for k, v in hp.__dict__.items()}
+    elif isinstance(hp, dict):
+        return {k: hparams_to_dict(v) for k, v in hp.items()}
+    elif isinstance(hp, (list, tuple)):
+        return [hparams_to_dict(v) for v in hp]
+    else:
+        return hp
 
 def export_onnx(args):
     torch.set_grad_enabled(False)
@@ -345,7 +356,11 @@ def export_onnx(args):
         dynamo=False
     )
 
-    print("Export complete!")
+    # Save Config for Native ONNX Inference
+    with open(f"{output_dir}/config.json", "w", encoding="utf-8") as f:
+        json.dump(hparams_to_dict(hps), f, indent=4, ensure_ascii=False)
+    
+    print(f"Export complete! Config saved to {output_dir}/config.json")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GPT-SoVITS ONNX Export")

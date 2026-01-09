@@ -186,7 +186,7 @@ def optimize_single_model(input_path, output_path):
     onnx.save(model, output_path)
     print(f"  Saved: {output_path}")
 
-
+import shutil
 def process_directory(input_dir, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     for filename in os.listdir(input_dir):
@@ -198,8 +198,9 @@ def process_directory(input_dir, output_dir):
             # 复制 .data 文件 (如果有)
             dfile = os.path.join(input_dir, filename + ".data")
             if os.path.exists(dfile):
-                import shutil
+
                 shutil.copy(dfile, os.path.join(output_dir, filename + ".data"))
+    shutil.copy(os.path.join(input_dir, "config.json"),os.path.join(output_dir, "config.json"))
     print(f"\nOptimization complete: {output_dir}")
 
 
