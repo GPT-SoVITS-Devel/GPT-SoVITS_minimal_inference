@@ -132,7 +132,7 @@ class GPTSoVITSInference:
             model_version = dict_s2["config"]["model"]["version"]
         elif "sv_emb.weight" in dict_s2["weight"]:
             model_version = "v2Pro"
-        
+
         self.hps.model.version = model_version
         print(f"Detected SoVITS model version: {model_version}")
 
@@ -171,23 +171,24 @@ class GPTSoVITSInference:
             with torch.no_grad():
                 # Dummy GPT input
                 dummy_prompt = torch.zeros((1, 1), dtype=torch.long, device=self.device)
-                dummy_bert = torch.zeros((1, 1024, len(phones) + 1), dtype=torch.float16 if self.is_half else torch.float32, device=self.device)
+                dummy_bert = torch.zeros((1, 1024, len(phones) + 1),
+                                         dtype=torch.float16 if self.is_half else torch.float32, device=self.device)
                 dummy_phones = torch.LongTensor(phones + [0]).unsqueeze(0).to(self.device)
                 dummy_phones_len = torch.tensor([dummy_phones.shape[-1]]).to(self.device)
-                
+
                 # GPT warmup
                 pred_semantic, idx = self.t2s_model.model.infer_panel(
                     dummy_phones, dummy_phones_len, dummy_prompt, dummy_bert,
                     top_k=5, top_p=1, temperature=1, early_stop_num=50
                 )
-                
+
                 # Dummy SoVITS input
                 dummy_spec = torch.zeros((1, self.hps.data.filter_length // 2 + 1, 10), device=self.device)
                 if self.is_half: dummy_spec = dummy_spec.half()
                 # Correct slicing for warmup as well
                 dummy_prefix_len = dummy_prompt.shape[1]
                 dummy_semantic = pred_semantic[:, dummy_prefix_len:].unsqueeze(0)
-                
+
                 # SoVITS warmup
                 _ = self.vq_model.decode(
                     dummy_semantic,
@@ -275,10 +276,10 @@ class GPTSoVITSInference:
                 else:
                     langlist.append(language.replace("all_", ""))
                 textlist.append(tmp["text"])
-        
+
         print(f"Text segments: {textlist}")
         print(f"Language segments: {langlist}")
-        
+
         phones_list = []
         bert_list = []
         norm_text_list = []
@@ -290,7 +291,7 @@ class GPTSoVITSInference:
             phones_list.append(phones)
             norm_text_list.append(norm_text)
             bert_list.append(bert)
-        
+
         bert = torch.cat(bert_list, dim=1)
         phones = sum(phones_list, [])
         norm_text = "".join(norm_text_list)
@@ -321,13 +322,13 @@ class GPTSoVITSInference:
               top_k=5, top_p=1, temperature=1, speed=1, pause_length=0.3):
 
         print(f"Inferencing: {text} ({text_lang})")
-        
+
         if self.device == "cuda": torch.cuda.synchronize()
         t_all_start = time.perf_counter()
         segments = split_text(text)
         if not segments:
             return np.zeros(0), self.hps.data.sampling_rate
-            
+
         final_audios = []
         sr = self.hps.data.sampling_rate
 
@@ -355,7 +356,8 @@ class GPTSoVITSInference:
             refer_spec, refer_audio = self.get_spepc(ref_wav_path)
             if refer_audio.shape[0] > 1: refer_audio = refer_audio[0].unsqueeze(0)
             if self.hps.data.sampling_rate != 16000:
-                audio_16k = torchaudio.transforms.Resample(self.hps.data.sampling_rate, 16000).to(self.device)(refer_audio)
+                audio_16k = torchaudio.transforms.Resample(self.hps.data.sampling_rate, 16000).to(self.device)(
+                    refer_audio)
             else:
                 audio_16k = refer_audio
             sv_emb = self.sv_model.compute_embedding3(audio_16k)
@@ -372,8 +374,8 @@ class GPTSoVITSInference:
         total_gpt_tokens = 0
 
         for i, seg in enumerate(segments):
-            print(f"Processing segment {i+1}/{len(segments)}: {seg}")
-            
+            print(f"Processing segment {i + 1}/{len(segments)}: {seg}")
+
             # Process Text Segment
             t_seg_text_start = time.perf_counter()
             phones2, bert2, norm_text2 = self.get_phones_and_bert(seg, text_lang, self.hps.model.version)
@@ -420,12 +422,12 @@ class GPTSoVITSInference:
             if self.device == "cuda": torch.cuda.synchronize()
             t_sovits_end = time.perf_counter()
             total_sovits_time += (t_sovits_end - t_sovits_start)
-                
+
             audio_np = audio.cpu().float().numpy()
             # Remove DC offset per segment to prevent drift
             audio_np = audio_np - np.mean(audio_np)
             final_audios.append(audio_np)
-            
+
             if i == 0:
                 t_first_segment = time.perf_counter() - t_all_start
 
@@ -433,7 +435,7 @@ class GPTSoVITSInference:
                 final_audios.append(np.zeros(int(sr * pause_length)))
 
         t_all_end = time.perf_counter()
-        
+
         # Final Audio Post-processing
         audio_final = np.concatenate(final_audios)
         # Peak normalization to ensure consistent volume

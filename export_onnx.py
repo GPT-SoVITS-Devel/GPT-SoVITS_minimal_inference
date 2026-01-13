@@ -7,6 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 from GPT_SoVITS.process_ckpt import load_sovits_new, get_sovits_version_from_path_fast
 from GPT_SoVITS.feature_extractor import cnhubert
+from GPT_SoVITS.text import _symbol_to_id_v2
 from GPT_SoVITS.AR.models.t2s_lightning_module import Text2SemanticLightningModule
 from GPT_SoVITS.module.models import SynthesizerTrn
 from transformers import AutoModelForMaskedLM, AutoTokenizer
@@ -357,8 +358,10 @@ def export_onnx(args):
     )
 
     # Save Config for Native ONNX Inference
+    config_dict = hparams_to_dict(hps)
+    config_dict["symbol_to_id"] = _symbol_to_id_v2
     with open(f"{output_dir}/config.json", "w", encoding="utf-8") as f:
-        json.dump(hparams_to_dict(hps), f, indent=4, ensure_ascii=False)
+        json.dump(config_dict, f, indent=4, ensure_ascii=False)
     
     print(f"Export complete! Config saved to {output_dir}/config.json")
 

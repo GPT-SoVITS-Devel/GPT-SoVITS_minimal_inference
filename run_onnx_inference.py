@@ -73,7 +73,7 @@ def sample_topk(topk_values, topk_indices, temperature=1.0):
     return np.array(samples, dtype=np.int64)[:, None]
 
 class GPTSoVITS_ONNX_Inference:
-    def __init__(self, onnx_dir, bert_path, device="cpu"):
+    def __init__(self, onnx_dir, bert_path, device="cpu", gpu_mem_limit=None):
         self.onnx_dir = onnx_dir
         self.device = device
         
@@ -84,7 +84,19 @@ class GPTSoVITS_ONNX_Inference:
         sol.log_severity_level=1
 
         if device == "cuda":
-            self.providers = [("CUDAExecutionProvider", {"device_id": 0, "arena_extend_strategy": "kSameAsRequested"}), "CPUExecutionProvider"]
+            cuda_options = {
+                "device_id": 0,
+                "arena_extend_strategy": "kSameAsRequested",
+            }
+
+            # 如果指定了显存限制，添加到配置中
+            if gpu_mem_limit is not None and gpu_mem_limit > 0:
+                # 转换为字节 (Bytes)
+                limit_in_bytes = int(gpu_mem_limit * 1024 * 1024 * 1024)
+                cuda_options["gpu_mem_limit"] = limit_in_bytes
+                print(f"限制最大显存使用为: {gpu_mem_limit} GB ({limit_in_bytes} bytes)")
+
+            self.providers = [("CUDAExecutionProvider", cuda_options), "CPUExecutionProvider"]
         else:
             self.providers = ["CPUExecutionProvider"]
         
@@ -369,7 +381,7 @@ class GPTSoVITS_ONNX_Inference:
         final_audios = []
         sr = self.hps["data"]["sampling_rate"]
 
-        # 4. SoVITS Setup
+        # SoVITS Setup
         wav_ref, _ = librosa.load(ref_wav_path, sr=sr)
         spec = spectrogram_torch(torch.from_numpy(wav_ref)[None, :], self.hps["data"]["filter_length"], self.hps["data"]["sampling_rate"],
                                  self.hps["data"]["hop_length"], self.hps["data"]["win_length"], center=False).numpy()
@@ -383,7 +395,7 @@ class GPTSoVITS_ONNX_Inference:
             tmp[:, :min(sv_emb.shape[-1], sv_size)] = sv_emb[:, :min(sv_emb.shape[-1], sv_size)]
             sv_emb = tmp
 
-        # 2. Process Reference Text (Once)
+        #  Process Reference Text (Once)
         t_start = time.perf_counter()
         phones1, bert1, norm_text1 = self.get_phones_and_bert(prompt_text, prompt_lang, self.version)
         t_text_proc += time.perf_counter() - t_start
@@ -525,11 +537,13 @@ if __name__ == "__main__":
     parser.add_argument("--lang", default="zh")
     parser.add_argument("--bert_path", default="pretrained_models/chinese-roberta-wwm-ext-large")
     parser.add_argument("--pause_length", type=float, default=0.3)
+    parser.add_argument("--gpu_mem_limit", type=float, default=None, help="限制最大显存使用 (GB)")
     args = parser.parse_args()
 
     GPTSoVITS_ONNX_Inference(
         args.onnx_dir, args.bert_path,
-        device="cuda" if torch.cuda.is_available() else "cpu"
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        gpu_mem_limit=args.gpu_mem_limit,
     ).infer(
         args.ref_audio, args.ref_text, args.ref_lang, args.text, args.lang, 
         output_path=args.output, pause_length=args.pause_length

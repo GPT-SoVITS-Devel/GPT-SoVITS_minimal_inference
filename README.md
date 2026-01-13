@@ -23,21 +23,22 @@ KV-Cache optimization, and zero-copy streaming.
 
 ## 🌟 Core Vision
 
-To solve the performance bottlenecks of GPT-SoVITS in production environments through low-level operator rewriting and
-architectural decoupling, without compromising model accuracy or requiring retraining.
+We ain't here to nerf your model accuracy or break your production setup with retraining nonsense. We are here to smash
+those bottlenecks into oblivion.
 
-We strive for: **Fast**, **Lightweight**, **High Compatibility**, and **Portability**.
+Our goal is simple: **Make GPU go brrr**. We strive for: **Fast AF 🏎️**, **Space-Time Tradeoff ⚖️**, **Compatible AF 🤝
+**, and **Portable 🌍**. No cap, just pure speed. 😤
 
 ## 🚀 Performance Benchmarks
 
 *Environment: I7 12700 | RTX 2080TI (22G) | CUDA 12.9 | FP16 Precision*
 
-| Metric                      | Native PyTorch | ONNX (fp16) | ONNX Stream | TensorRT (FP16)      |
-|:----------------------------|:---------------|:------------|:------------|:---------------------|
-| **First Token Latency (↓)** | 2.524 s        | 1.983 s     | **1.000 s** | 2.022 s              |
-| **Inference Speed (↑)**     | 144.8 tok/s    | 172.4 tok/s | 167.5 tok/s | **291.6 tok/s** (🤯) |
-| **RTF (↓)**                 | 0.3434         | 0.3325      | 0.3100      | **0.2096**           |
-| **VRAM Usage (↓)**          | 2.8 G          | 3.9 G       | 4.5 G       | 4.8 G                |
+| Metric                      | Native PyTorch(Original Project) | Native PyTorch(This Project) | ONNX        | ONNX Stream | TensorRT             |
+|:----------------------------|:---------------------------------|:-----------------------------|:------------|:------------|:---------------------|
+| **First Token Latency (↓)** | 5.417s                           | 2.424 s                      | 2.683 s     | **1.000 s** | 2.022 s              |
+| **Inference Speed (↑)**     | 148.65 tokens/s                  | 144.8 tok/s                  | 172.4 tok/s | 167.5 tok/s | **291.6 tok/s** (🤯) |
+| **RTF (↓)**                 | 0.5229                           | 0.3434                       | 0.3325      | 0.3100      | **0.2096**           |
+| **VRAM Usage (↓)**          | 3 G                              | 2.8 G                        | 3.9 G       | 4.5 G       | 4.8 G                |
 
 ---
 
@@ -94,7 +95,7 @@ python export_onnx.py \
     --cnhubert_base_path pretrained_models\chinese-hubert-base
     --bert_path pretrained_models\chinese-roberta-wwm-ext-large
     --output_dir  "onnx_export/firefly_v2_proplus"
-    --max_len 1000
+    --max_len 1000 # Reducing the size of the GPU can speed up throughput and decrease the pre-allocated video memory, but it requires parameter modification. Generally speaking, 1000 can find a relatively acceptable balance in most scenarios (text of varying lengths).
 ```
 
 ### 2. FP16 Optimization (Optional)
