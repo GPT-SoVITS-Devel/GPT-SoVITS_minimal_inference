@@ -53,8 +53,9 @@ class GPTSoVITS_TRT_Streaming_Inference(GPTSoVITS_TRT_Inference):
                 return
 
             sr = self.hps["data"]["sampling_rate"]
-            samples_per_token_fixed = sr // 25
-            h_len, l_len, fade_len = 512, 16, 1280
+            # 基础采样率比例
+            base_samples_per_token = sr / 25.0
+            h_len, l_len, fade_len = 32, 16, 256
             prev_fade_out = None
 
             wav_ref, _ = librosa.load(ref_wav_path, sr=sr)
@@ -148,14 +149,17 @@ class GPTSoVITS_TRT_Streaming_Inference(GPTSoVITS_TRT_Inference):
                         "speed": torch.tensor([speed], dtype=torch.float32, device=self.device),
                     }
                     sovits_inputs = {k: v for k, v in sovits_inputs.items() if k in self.model_sovits.input_names}
-                    audio = self.model_sovits(sovits_inputs)["audio"]
+                    audio = self.model_sovits(sovits_inputs)["audio"].flatten()
                     
-                    # 使用浮点数计算以保持切片精度
-                    actual_samples_per_token = samples_per_token_fixed / speed
-                    h_samples = int((hist[:, -h_len:].shape[1] if hist is not None else 0) * actual_samples_per_token)
-                    c_samples = int(chunk_tokens.shape[1] * actual_samples_per_token)
-                    res = audio.flatten()[h_samples : h_samples + c_samples]
-                    return res.detach().cpu().numpy()
+                    # 动态计算每个token对应的实际样本数，以消除模型内部Padding或舍入导致的累计漂移(有一定效果)
+                    actual_samples_per_token = audio.shape[0] / full_sem.shape[1]
+                    h_count = hist[:, -h_len:].shape[1] if hist is not None else 0
+                    c_count = chunk_tokens.shape[1]
+                    
+                    h_samples = int(h_count * actual_samples_per_token)
+                    c_samples = int(c_count * actual_samples_per_token)
+                    
+                    return audio[h_samples : h_samples + c_samples].detach().cpu().numpy()
 
                 for i in range(max_steps):
                     idx_tensor = idx_tensors[i]
