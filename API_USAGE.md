@@ -4,47 +4,70 @@
 
 ## 快速启动
 
+### 1. 标准推理 (PyTorch)
 ```bash
 python api_server.py --host 0.0.0.0 --port 8000 --voices_config config/voices.json
 ```
 
+### 2. ONNX 推理
+```bash
+python api_server_onnx.py --host 0.0.0.0 --port 8001 --device cpu
+```
+
+### 3. TensorRT 推理
+```bash
+python api_server_trt.py --host 0.0.0.0 --port 8002 --device cuda
+```
+
 ### 命令行参数
 
-| 参数                | 说明            | 默认值                                               |
-|:------------------|:--------------|:--------------------------------------------------|
-| `--host`          | 监听地址          | `0.0.0.0`                                         |
-| `--port`          | 监听端口          | `8000`                                            |
-| `--cnhubert_path` | CNHubert 模型路径 | `pretrained_models/chinese-hubert-base`           |
-| `--bert_path`     | BERT 模型路径     | `pretrained_models/chinese-roberta-wwm-ext-large` |
-| `--voices_config` | 语音配置文件路径      | `config/voices.json`                              |
-| `--reload`        | 开发模式(热重载)     | `False`                                           |
-
-环境变量支持：`CNHUBERT_PATH`, `BERT_PATH`, `VOICES_CONFIG`。
+| 参数                | 说明                      | 默认值                                               | 适用服务            |
+|:------------------|:------------------------|:--------------------------------------------------|:----------------|
+| `--host`          | 监听地址                    | `0.0.0.0`                                         | 全部              |
+| `--port`          | 监听端口                    | `8000`/`8001`/`8002`                              | 全部              |
+| `--device`        | 推理设备 (`cpu`, `cuda`)    | `cpu`(ONNX) / `cuda`(TRT)                         | ONNX, TRT       |
+| `--cnhubert_path` | CNHubert 模型路径           | `pretrained_models/chinese-hubert-base`           | 标准              |
+| `--bert_path`     | BERT 模型路径               | `pretrained_models/chinese-roberta-wwm-ext-large` | 全部              |
+| `--voices_config` | 语音配置文件路径                | `config/voices.json`                              | 全部              |
+| `--reload`        | 开发模式(热重载)               | `False`                                           | 标准              |
 
 ---
 
 ## 配置文件 (`voices.json`)
 
-通过配置文件定义多个角色及其对应的模型路径和参考音频。
+根据所使用的推理引擎，在 `voices.json` 中配置对应的模型路径。
 
+### 1. 标准引擎配置
 ```json
-{
-  "my_character": {
+  "char_pytorch": {
     "gpt_path": "models/my_gpt.ckpt",
     "sovits_path": "models/my_sovits.pth",
     "ref_audio": "data/ref.wav",
-    "ref_text": "参考音频的文本内容",
-    "ref_lang": "zh",
-    "description": "角色描述信息",
-    "defaults": {
-      "speed": 1.0,
-      "top_k": 15,
-      "top_p": 1.0,
-      "temperature": 1.0,
-      "pause_length": 0.3
-    }
+    "ref_text": "参考文本",
+    "ref_lang": "zh"
   }
-}
+```
+
+### 2. ONNX 引擎配置
+`onnx_path` 应指向包含 `ssl.onnx`, `gpt_encoder.onnx` 等文件的目录。
+```json
+  "char_onnx": {
+    "onnx_path": "onnx_export/my_character",
+    "ref_audio": "data/ref.wav",
+    "ref_text": "参考文本",
+    "ref_lang": "zh"
+  }
+```
+
+### 3. TensorRT 引擎配置
+`trt_path` 应指向包含 `.engine` 文件和 `config.json` 的目录。
+```json
+  "char_trt": {
+    "trt_path": "onnx_export/my_character_trt",
+    "ref_audio": "data/ref.wav",
+    "ref_text": "参考文本",
+    "ref_lang": "zh"
+  }
 ```
 
 ---

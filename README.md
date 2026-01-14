@@ -135,11 +135,24 @@ python onnx_to_fp16.py --input_dir "onnx_export/firefly_v2_proplus" \
 > Note: Compiling TRT engines takes time and must be done for each specific hardware/CUDA/TRT version combination.
 
 ```bash
+```bash
 # Linux
 onnx2trt.sh <onnx_input_dir> <output_dir>
 # Windows
 onnx2trt.bat <onnx_input_dir> <output_dir>
 ```
+
+---
+
+## 🌐 API Service
+
+If you're tired of staring at the terminal or want your backend to talk to this beast directly, we've squeezed out an **OpenAI-compatible** API service with streaming support. It's basically "Plug and Play".
+
+*   **PyTorch (Stable)**: `python api_server.py` (Port 8000, for the traditionalists)
+*   **ONNX (Turbo)**: `python api_server_onnx.py` (Port 8001, CPU users' salvation, easy deployment)
+*   **TensorRT (Godspeed)**: `python api_server_trt.py` (Port 8002, GPU screaming, performance peaking)
+
+👉 **[Check the API Documentation](./API_USAGE.md)** — Please, just read the docs. I beg you. Everything is in there.
 
 ---
 
