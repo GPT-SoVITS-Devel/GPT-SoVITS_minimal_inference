@@ -30,10 +30,13 @@ except ImportError:
     raise
 
 class GPTSoVITS_TRT_Streaming_Inference(GPTSoVITS_TRT_Inference):
-    """Subclass of TRT Inference to provide a streaming generator."""
+    """Subclass of TRT Inference to provide a true token-level streaming generator."""
     
     def infer_stream(self, ref_wav_path, prompt_text, prompt_lang, text, text_lang,
-                     top_k=5, temperature=1.0, noise_scale=0.5, speed=1.0, pause_length=0.3):
+                     top_k=5, temperature=1.0, noise_scale=0.5, speed=1.0, chunk_length=24, pause_length=0.3):
+
+        mute_matrix_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "GPT_SoVITS/pretrained_models/gpts1_mute_emb_sim_matrix.pt")
+        mute_matrix = torch.load(mute_matrix_path, map_location=self.device) if os.path.exists(mute_matrix_path) else None
 
         with torch.cuda.stream(self.stream):
             wav16k, _ = librosa.load(ref_wav_path, sr=16000)
@@ -50,6 +53,9 @@ class GPTSoVITS_TRT_Streaming_Inference(GPTSoVITS_TRT_Inference):
                 return
 
             sr = self.hps["data"]["sampling_rate"]
+            samples_per_token_fixed = sr // 25
+            h_len, l_len, fade_len = 512, 16, 1280
+            prev_fade_out = None
 
             wav_ref, _ = librosa.load(ref_wav_path, sr=sr)
             spec = spectrogram_torch(torch.from_numpy(wav_ref)[None, :], 
@@ -97,13 +103,12 @@ class GPTSoVITS_TRT_Streaming_Inference(GPTSoVITS_TRT_Inference):
 
                 current_samples = sample_topk(topk_values, topk_indices, temperature=temperature).to(self.device)
                 prompt_semantic_gpu = prompt_semantic.to(self.device)
-                decoded_semantic_list = [prompt_semantic_gpu, current_samples]
-
-                # GPT Step
+                
+                # GPT Step Setup
                 kv_max_len = k_cache.shape[2]
                 base_len = int(x_len.item() + y_len.item())
                 max_gen_len = kv_max_len - base_len - 1
-                max_steps = min(1000, max_gen_len) if max_gen_len > 0 else 1
+                max_steps = min(1500, max_gen_len) if max_gen_len > 0 else 1
                 
                 k_cache_0, v_cache_0 = k_cache.clone(), v_cache.clone()
                 k_cache_1, v_cache_1 = torch.zeros_like(k_cache_0), torch.zeros_like(v_cache_0)
@@ -123,6 +128,35 @@ class GPTSoVITS_TRT_Streaming_Inference(GPTSoVITS_TRT_Inference):
                 idx_tensors = [torch.tensor([i], dtype=torch.int64, device=idx_device) for i in range(max_steps)]
                 step_outputs = {"k_cache_new": None, "v_cache_new": None}
 
+                chunk_queue = []
+                tokens_buffer = [current_samples]
+                history_tokens = None
+                token_counter = 1
+
+                def decode_chunk(chunk_tokens, hist, lookahead):
+                    inp_list = []
+                    if hist is not None: inp_list.append(hist[:, -h_len:])
+                    inp_list.append(chunk_tokens)
+                    if lookahead is not None: inp_list.append(lookahead[:, :l_len])
+                    
+                    full_sem = torch.cat(inp_list, dim=1)[:, None, :]
+                    sovits_inputs = {
+                        "pred_semantic": full_sem.to(torch.int64),
+                        "text_seq": torch.tensor(phones2, dtype=torch.int64, device=self.device)[None, :],
+                        "refer_spec": spec, "sv_emb": sv_emb,
+                        "noise_scale": torch.tensor([noise_scale], dtype=torch.float32, device=self.device),
+                        "speed": torch.tensor([speed], dtype=torch.float32, device=self.device),
+                    }
+                    sovits_inputs = {k: v for k, v in sovits_inputs.items() if k in self.model_sovits.input_names}
+                    audio = self.model_sovits(sovits_inputs)["audio"]
+                    
+                    # 使用浮点数计算以保持切片精度
+                    actual_samples_per_token = samples_per_token_fixed / speed
+                    h_samples = int((hist[:, -h_len:].shape[1] if hist is not None else 0) * actual_samples_per_token)
+                    c_samples = int(chunk_tokens.shape[1] * actual_samples_per_token)
+                    res = audio.flatten()[h_samples : h_samples + c_samples]
+                    return res.detach().cpu().numpy()
+
                 for i in range(max_steps):
                     idx_tensor = idx_tensors[i]
                     src_cache, dst_cache = caches[i % 2], caches[(i + 1) % 2]
@@ -135,36 +169,65 @@ class GPTSoVITS_TRT_Streaming_Inference(GPTSoVITS_TRT_Inference):
                     }, outputs=step_outputs, sync=False)
                     
                     topk_v, topk_i = step_out["topk_values"].detach().cpu(), step_out["topk_indices"].detach().cpu()
-                    if temperature != 1.0: topk_v = topk_v / temperature
-                    probs = torch.softmax(topk_v, dim=-1)
-                    indices_of_indices = torch.multinomial(probs, num_samples=1)
-                    current_samples = torch.gather(topk_i, -1, indices_of_indices).to(self.device)
+                    current_samples = sample_topk(topk_v, topk_indices=topk_i, temperature=temperature).to(self.device)
                     
-                    decoded_semantic_list.append(current_samples)
                     if current_samples[0, 0] == 1024: break
-                
-                pred_semantic = torch.cat(decoded_semantic_list, dim=1)
-                generated_sem = pred_semantic[:, prompt_semantic.shape[1]:]
-                if generated_sem[0, -1] == 1024: generated_sem = generated_sem[:, :-1]
-                generated_sem = generated_sem[:, None, :]
+                    
+                    tokens_buffer.append(current_samples)
+                    token_counter += 1
 
-                # SoVITS
-                sovits_inputs = {
-                    "pred_semantic": generated_sem.to(torch.int64),
-                    "text_seq": torch.tensor(phones2, dtype=torch.int64, device=self.device)[None, :],
-                    "refer_spec": spec, "sv_emb": sv_emb,
-                    "noise_scale": torch.tensor([noise_scale], dtype=torch.float32, device=self.device),
-                    "speed": torch.tensor([speed], dtype=torch.float32, device=self.device),
-                }
-                sovits_inputs = {k: v for k, v in sovits_inputs.items() if k in self.model_sovits.input_names}
-                audio = self.model_sovits(sovits_inputs)["audio"]
-                torch.cuda.synchronize()
+                    is_split = False
+                    if mute_matrix is not None and token_counter >= chunk_length + 2:
+                        recent_tokens = torch.cat(tokens_buffer, dim=1).flatten()
+                        scores = mute_matrix[recent_tokens] - 0.3
+                        scores[scores < 0] = -1
+                        scores[:-1] += scores[1:]
+                        argmax_idx = torch.argmax(scores).item()
+                        if scores[argmax_idx] >= 0 and argmax_idx + 1 >= chunk_length:
+                            split_idx = argmax_idx + 1
+                            chunk_queue.append(torch.cat(tokens_buffer[:split_idx], dim=1))
+                            tokens_buffer = tokens_buffer[split_idx:]
+                            token_counter -= split_idx
+                            is_split = True
+                    elif mute_matrix is None and token_counter >= chunk_length:
+                        chunk_queue.append(torch.cat(tokens_buffer, dim=1))
+                        tokens_buffer = []
+                        token_counter = 0
+                        is_split = True
+
+                    while len(chunk_queue) > 1:
+                        curr = chunk_queue.pop(0)
+                        audio_data = decode_chunk(curr, history_tokens, chunk_queue[0])
+                        
+                        if prev_fade_out is not None:
+                            fade_in = np.linspace(0, 1, fade_len)
+                            audio_data[:fade_len] = audio_data[:fade_len] * fade_in + prev_fade_out * (1 - fade_in)
+                        
+                        prev_fade_out = audio_data[-fade_len:]
+                        yield audio_data[:-fade_len]
+                        history_tokens = curr if history_tokens is None else torch.cat([history_tokens, curr], dim=1)[:, -h_len:]
+
+                if tokens_buffer:
+                    chunk_queue.append(torch.cat(tokens_buffer, dim=1))
                 
-                audio_np = audio.squeeze().detach().cpu().numpy()
-                audio_np = audio_np - np.mean(audio_np)
-                
-                yield audio_np
-                
+                while chunk_queue:
+                    curr = chunk_queue.pop(0)
+                    next_chunk = chunk_queue[0] if chunk_queue else None
+                    audio_data = decode_chunk(curr, history_tokens, next_chunk)
+                    
+                    if prev_fade_out is not None:
+                        fade_in = np.linspace(0, 1, fade_len)
+                        audio_data[:fade_len] = audio_data[:fade_len] * fade_in + prev_fade_out * (1 - fade_in)
+                    
+                    if next_chunk is not None:
+                        yield audio_data[:-fade_len]
+                        prev_fade_out = audio_data[-fade_len:]
+                    else:
+                        yield audio_data
+                        prev_fade_out = None
+                    
+                    history_tokens = curr if history_tokens is None else torch.cat([history_tokens, curr], dim=1)[:, -h_len:]
+
                 if seg_idx < len(segments) - 1 and pause_length > 0:
                     yield np.zeros(int(sr * pause_length))
 
@@ -231,8 +294,10 @@ class SpeechRequest(BaseModel):
     response_format: str = "wav"
     speed: Optional[float] = None
     top_k: Optional[int] = None
+    top_p: Optional[float] = None
     temperature: Optional[float] = None
     text_lang: str = "auto"
+    chunk_length: int = 24
     pause_length: Optional[float] = None
     noise_scale: Optional[float] = None
     ref_audio: Optional[str] = None
@@ -277,7 +342,8 @@ async def text_to_speech(request: SpeechRequest):
             gen = engine.infer_stream(
                 ref_wav_path=abs_ref_audio, prompt_text=ref_text, prompt_lang=ref_lang,
                 text=request.input, text_lang=request.text_lang, top_k=top_k,
-                temperature=temperature, speed=speed, noise_scale=noise_scale, pause_length=pause_length
+                temperature=temperature, speed=speed, noise_scale=noise_scale, 
+                chunk_length=request.chunk_length, pause_length=pause_length
             )
             sr = engine.hps["data"]["sampling_rate"]
             if request.response_format == "wav":
