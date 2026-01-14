@@ -1,8 +1,9 @@
-// example
 {
     "firefly": {
         "gpt_path": "pretrained_models/GPT_weights_v2ProPlus/firefly_v2_pp-e25.ckpt",
         "sovits_path": "pretrained_models/SoVITS_weights_v2ProPlus/firefly_v2_pp_e10_s590.pth",
+        "onnx_path": "onnx_export/firefly_v2_proplus_fp16",
+        "trt_path": "onnx_export/firefly_v2_proplus_fp16",
         "ref_audio": "pretrained_models/看，这尊雕像就是匹诺康尼大名鼎鼎的卡通人物钟表小子.wav",
         "ref_text": "看，这尊雕像就是匹诺康尼大名鼎鼎的卡通人物“钟表小子",
         "ref_lang": "zh",

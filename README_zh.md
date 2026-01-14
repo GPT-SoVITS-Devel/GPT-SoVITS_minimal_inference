@@ -131,11 +131,24 @@ python onnx_to_fp16.py --input_dir "onnx_export/firefly_v2_proplus" \
 > 编译trt时间较久是正常情况,每台机器在cuda/trt版本不一致时一定要重新编译!!!
 
 ```bash
+```bash
 # linux
 onnx2trt.sh <onnx_input_dir> <output_dir>
 # windows
 onnx2trt.bat <onnx_input_dir> <output_dir>
 ```
+
+---
+
+## 🌐 API 服务
+
+如果您不想每天对着终端敲命令，或者想让您的后端程序直接调用。我们整出了兼容 **OpenAI 协议** 的 API 服务，支持流式输出。
+
+*   **PyTorch 稳定版**: `python api_server.py` (默认 8000 端口，适合还没折腾 ONNX 的你)
+*   **ONNX 极速版**: `python api_server_onnx.py` (默认 8001 端口，CPU 用户的福音，部署简单)
+*   **TensorRT 究极版**: `python api_server_trt.py` (默认 8002 端口，显卡在尖叫，性能在狂飙)
+
+👉 **[点击查阅 API 详细文档](./API_USAGE.md)** —— 求求了，看一眼文档吧，都在这里了。
 
 ---
 
