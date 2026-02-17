@@ -15,9 +15,9 @@ MODEL_CONFIGS = {
     "gpt_encoder": {"fp16": True, "sensitive": ["Pow", "Exp", "Mean", "ReduceMean", "LayerNormalization"]},
     "gpt_step": {"fp16": True, "sensitive": ["Pow", "Exp", "MatMulInteger", "LayerNormalization"]},
     "sovits": {"fp16": True, "sensitive": ["InstanceNormalization", "Resize", "Mean", "Sum", "Exp"], "native_sensitive": ["Resize"]},
-    # spectrogram 和 sv_embedding 的 STFT 需要 FP32 输入，所以输入保持 FP32
-    "spectrogram": {"fp16": True, "sensitive": ["Sqrt", "Pow", "Mean", "ReduceMean", "Div"], "keep_input_types": True},
-    "sv_embedding": {"fp16": True, "sensitive": ["LayerNormalization", "Mean", "ReduceMean", "Pow", "Sqrt", "Div"], "keep_input_types": True},
+    # spectrogram 和 sv_embedding 保持 FP32，因为 STFT 和后续计算需要 FP32 精度
+    "spectrogram": {"fp16": False, "sensitive": []},
+    "sv_embedding": {"fp16": False, "sensitive": []},
 }
 
 # 全局通用黑名单
