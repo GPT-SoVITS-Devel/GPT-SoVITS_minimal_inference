@@ -277,7 +277,7 @@ class ONNXValidator:
         if failed_count > 0:
             print(f"\n❌ 存在精度损失，建议检查失败的模块")
             # 找出损失最大的模块
-            print("\n🔍 损失最大的模块（按余弦相似度排序）:")
+            print("\n🔍 损失最大的模块:")
             sorted_results = sorted(
                 self.validation_results,
                 key=lambda x: x["metrics"].get("cosine_similarity", 1.0)
@@ -297,8 +297,27 @@ class ONNXValidator:
         if output_path is None:
             output_path = os.path.join(self.output_dir, "validation_report.json")
 
+        def convert_numpy_types(obj):
+            """递归转换numpy类型为Python原生类型"""
+            if isinstance(obj, np.bool_):
+                return bool(obj)
+            elif isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {k: convert_numpy_types(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_numpy_types(v) for v in obj]
+            return obj
+
+        # 转换validation_results中的numpy类型
+        converted_results = convert_numpy_types(self.validation_results)
+
         with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(self.validation_results, f, indent=2, ensure_ascii=False)
+            json.dump(converted_results, f, indent=2, ensure_ascii=False)
 
         print(f"详细报告已保存到: {output_path}")
 
