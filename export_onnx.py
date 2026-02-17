@@ -121,6 +121,162 @@ class VQEncoder(nn.Module):
         # codes: [1, 1, T] (indices)
         return codes
 
+class SpectrogramWrapper(nn.Module):
+    def __init__(self, filter_length, hop_length, win_length, sampling_rate):
+        super().__init__()
+        self.filter_length = filter_length
+        self.hop_length = hop_length
+        self.win_length = win_length
+        self.sampling_rate = sampling_rate
+        self.register_buffer("hann_window", torch.hann_window(win_length))
+
+    def forward(self, y):
+        # y: [1, T] audio waveform
+        if torch.min(y) < -1.2:
+            print("min value is ", torch.min(y))
+        if torch.max(y) > 1.2:
+            print("max value is ", torch.max(y))
+
+        n_fft = self.filter_length
+        hop_size = self.hop_length
+        win_size = self.win_length
+
+        # Pad audio for STFT
+        y_padded = torch.nn.functional.pad(
+            y.unsqueeze(1), (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)), mode="reflect"
+        )
+        y_padded = y_padded.squeeze(1)
+
+        # Compute STFT
+        spec = torch.stft(
+            y_padded,
+            n_fft,
+            hop_length=hop_size,
+            win_length=win_size,
+            window=self.hann_window,
+            center=False,
+            pad_mode="reflect",
+            normalized=False,
+            onesided=True,
+            return_complex=False,
+        )
+
+        # Compute magnitude spectrum
+        spec = torch.sqrt(spec.pow(2).sum(-1) + 1e-8)
+        return spec
+
+class SVEmbeddingWrapper(nn.Module):
+    """
+    Wrapper for SV model compute_embedding3 to enable ONNX export.
+    Combines FBank feature extraction and ERes2NetV2 embedding model.
+    """
+    def __init__(self, sv_model):
+        super().__init__()
+        self.embedding_model = sv_model
+        # FBank parameters
+        self.num_mel_bins = 80
+        self.sample_frequency = 16000.0
+        self.frame_length = 25.0  # ms
+        self.frame_shift = 10.0    # ms
+        self.dither = 0.0
+        self.low_freq = 20.0
+        self.high_freq = 0.0  # 0 means Nyquist
+        self.window_type = "povey"
+        self.remove_dc_offset = True
+        self.preemphasis_coefficient = 0.97
+
+        # Pre-compute mel filter bank (ONNX compatible)
+        self.window_size = int(self.sample_frequency * self.frame_length * 0.001)
+        self.window_shift = int(self.sample_frequency * self.frame_shift * 0.001)
+        self.padded_window_size = 2 ** ((self.window_size - 1).bit_length())
+        num_fft_bins = self.padded_window_size // 2 + 1
+
+        self.register_buffer("mel_filterbank", self._create_mel_filterbank(num_fft_bins))
+
+    def _create_mel_filterbank(self, num_fft_bins):
+        import math
+        from librosa.filters import mel as librosa_mel_fn
+
+        high_freq = self.high_freq
+        if high_freq <= 0.0:
+            high_freq = self.sample_frequency / 2.0
+
+        mel = librosa_mel_fn(
+            sr=self.sample_frequency,
+            n_fft=self.padded_window_size,
+            n_mels=self.num_mel_bins,
+            fmin=self.low_freq,
+            fmax=high_freq
+        )
+        return torch.from_numpy(mel).float()
+
+    def forward(self, wav):
+        # wav: [B, T] audio waveform at 16kHz
+        B = wav.shape[0]
+        device = wav.device
+        dtype = wav.dtype
+
+        # Extract FBank features using STFT directly (ONNX compatible)
+        # Pre-emphasis
+        if self.preemphasis_coefficient != 0.0:
+            wav = wav - self.preemphasis_coefficient * torch.nn.functional.pad(wav, (1, 0), mode="replicate")[:, :-1]
+
+        # Pad for STFT (same padding as kaldi)
+        pad = self.window_size // 2 - self.window_shift // 2
+        if pad > 0:
+            wav_padded = torch.nn.functional.pad(wav, (pad, pad), mode="reflect")
+        else:
+            wav_padded = torch.cat((wav[:, -pad:], wav, wav[:, :pad]), dim=1)
+
+        # Create Povey window (Hanning window^0.85)
+        window = torch.hann_window(self.window_size, device=device, dtype=dtype) ** 0.85
+
+        # Compute STFT
+        stft_output = torch.stft(
+            wav_padded,
+            n_fft=self.padded_window_size,
+            hop_length=self.window_shift,
+            win_length=self.window_size,
+            window=window,
+            center=False,
+            pad_mode="reflect",
+            normalized=False,
+            onesided=True,
+            return_complex=False
+        )
+        # stft_output: [B, padded_window_size//2+1, num_frames, 2]
+
+        # Compute power spectrum
+        spectrum = torch.sqrt(stft_output.pow(2).sum(-1) + 1e-8).pow(2.0)
+        # spectrum: [B, num_fft_bins, num_frames]
+
+        # Remove DC offset per frame
+        if self.remove_dc_offset:
+            spectrum = spectrum - spectrum.mean(dim=1, keepdim=True)
+
+        # Transpose for mel filter bank: [B, num_frames, num_fft_bins]
+        spectrum_t = spectrum.transpose(1, 2)
+
+        # Apply mel filter bank
+        # mel_filterbank: [num_mel_bins, num_fft_bins]
+        # spectrum_t: [B, num_frames, num_fft_bins]
+        # result: [B, num_frames, num_mel_bins]
+        mel_energies = torch.matmul(spectrum_t, self.mel_filterbank.T)
+
+        # Log compression
+        epsilon = torch.finfo(spectrum.dtype).eps
+        mel_energies = torch.max(mel_energies, torch.tensor(epsilon, device=device, dtype=dtype)).log()
+
+        # mel_energies: [B, T, F] where F=80 (already in correct format)
+        # No permute needed
+        feat = mel_energies
+
+        # Pass through ERes2NetV2 forward3
+        # forward3 returns [B, 20480] regardless of input length
+        sv_emb = self.embedding_model.forward3(feat)
+
+        return sv_emb
+
 def hparams_to_dict(hp):
     if hasattr(hp, "__dict__"):
         return {k: hparams_to_dict(v) for k, v in hp.__dict__.items()}
@@ -190,6 +346,16 @@ def export_onnx(args):
         if "EuclideanCodebook" in module.__class__.__name__:
             import types
             module.init_embed_ = types.MethodType(lambda self, data: None, module)
+
+    # SV Model (for speaker embedding)
+    sv_path = os.environ.get("SV_MODEL_PATH", "pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt")
+    sys.path.append(os.path.join(os.path.dirname(__file__), "GPT_SoVITS", "eres2net"))
+    from ERes2NetV2 import ERes2NetV2
+    pretrained_state = torch.load(sv_path, map_location="cpu", weights_only=False)
+    sv_model = ERes2NetV2(baseWidth=24, scale=4, expansion=4)
+    sv_model.load_state_dict(pretrained_state)
+    sv_model.eval()
+    sv_model = sv_model.to(device)
 
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -335,8 +501,7 @@ def export_onnx(args):
         sv_emb = torch.randn(1, 20480)
         args_sovits.append(sv_emb)
         input_names.append("sv_emb")
-    
-    # Add noise_scale and speed at the end
+
     args_sovits.extend([noise_scale, speed])
     input_names.extend(["noise_scale", "speed"])
     
@@ -357,9 +522,56 @@ def export_onnx(args):
         dynamo=False
     )
 
-    # Save Config for Native ONNX Inference
+    # Export SpectrogramWrapper
+    print("Exporting Spectrogram...")
+    spec_wrapper = SpectrogramWrapper(
+        filter_length=hps_obj.data.filter_length,
+        hop_length=hps_obj.data.hop_length,
+        win_length=hps_obj.data.win_length,
+        sampling_rate=hps_obj.data.sampling_rate
+    )
+    # Input: [1, T] audio waveform at sampling_rate
+    dummy_wav = torch.randn(1, 48000)
+    torch.onnx.export(
+        spec_wrapper,
+        (dummy_wav,),
+        f"{output_dir}/spectrogram.onnx",
+        input_names=["audio"],
+        output_names=["spectrogram"],
+        dynamic_axes={"audio": {1: "time"}, "spectrogram": {2: "time"}},
+        opset_version=20,
+        dynamo=False
+    )
+
+    # Export SVEmbeddingWrapper
+    print("Exporting SV Embedding...")
+    sv_wrapper = SVEmbeddingWrapper(sv_model)
+    # Input: [B, T] audio waveform at 16kHz
+    dummy_wav_16k = torch.randn(1, 16000 * 3)
+    torch.onnx.export(
+        sv_wrapper,
+        (dummy_wav_16k,),
+        f"{output_dir}/sv_embedding.onnx",
+        input_names=["audio"],
+        output_names=["sv_embedding"],
+        dynamic_axes={"audio": {1: "time"}},
+        opset_version=20,
+        dynamo=False
+    )
+
     config_dict = hparams_to_dict(hps)
     config_dict["symbol_to_id"] = _symbol_to_id_v2
+    config_dict["spectrogram"] = {
+        "filter_length": hps_obj.data.filter_length,
+        "hop_length": hps_obj.data.hop_length,
+        "win_length": hps_obj.data.win_length,
+        "sampling_rate": hps_obj.data.sampling_rate
+    }
+
+    config_dict["sv_embedding"] = {
+        "embedding_size": 20480 if "Pro" in model_version else 512,
+        "model_version": model_version
+    }
     with open(f"{output_dir}/config.json", "w", encoding="utf-8") as f:
         json.dump(config_dict, f, indent=4, ensure_ascii=False)
     
@@ -371,8 +583,14 @@ if __name__ == "__main__":
     parser.add_argument("--sovits_path", required=True)
     parser.add_argument("--cnhubert_base_path", default="pretrained_models/chinese-hubert-base")
     parser.add_argument("--bert_path", default="pretrained_models/chinese-roberta-wwm-ext-large")
+    parser.add_argument("--sv_path", default=None, help="Path to SV model (default: pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt)")
     parser.add_argument("--max_len", type=int, default=2000, help="Pre-allocated KV cache length")
     parser.add_argument("--output_dir", default="onnx_export", help="Output directory for ONNX models")
     
     args = parser.parse_args()
+    
+    # Set SV model path if provided
+    if args.sv_path:
+        os.environ["SV_MODEL_PATH"] = args.sv_path
+    
     export_onnx(args)

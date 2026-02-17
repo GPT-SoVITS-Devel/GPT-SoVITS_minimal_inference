@@ -247,8 +247,11 @@ class ERes2NetV2(nn.Module):
         out4 = self.layer4(out3)
         out3_ds = self.layer3_ds(out3)
         fuse_out34 = self.fuse34(out4, out3_ds)
-        # print(111111111,fuse_out34.shape)#111111111 torch.Size([16, 2048, 10, 72])
-        return fuse_out34.flatten(start_dim=1, end_dim=2).mean(-1)
+        # fuse_out34: [B, 2048, 10, W]
+        # 使用 view 确保输出为 [B, 20480]
+        # 先 flatten 前三个维度，然后在时间维度求平均
+        out = fuse_out34.flatten(1, 2).mean(-1)
+        return out
         # stats = self.pool(fuse_out34)
         #
         # embed_a = self.seg_1(stats)

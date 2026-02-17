@@ -28,8 +28,6 @@ sys.path.append(os.path.join(cwd, "GPT_SoVITS"))
 from GPT_SoVITS.text.LangSegmenter import LangSegmenter
 from GPT_SoVITS.text import cleaned_text_to_sequence
 from GPT_SoVITS.text.cleaner import clean_text
-from GPT_SoVITS.module.mel_processing import spectrogram_torch
-from GPT_SoVITS.sv import SV
 
 def split_text(text):
     text = text.strip("\n")
@@ -114,6 +112,10 @@ class GPTSoVITS_ONNX_Inference:
 
         self.sess_sovits = onnxruntime.InferenceSession(f"{onnx_dir}/sovits.onnx", sess_options=so,
                                                         providers=self.providers)
+        self.sess_spectrogram = onnxruntime.InferenceSession(f"{onnx_dir}/spectrogram.onnx", sess_options=so,
+                                                             providers=self.providers)
+        self.sess_sv_embedding = onnxruntime.InferenceSession(f"{onnx_dir}/sv_embedding.onnx", sess_options=so,
+                                                              providers=self.providers)
 
         self.step_inputs_info = {node.name: node.type for node in self.sess_gpt_step.get_inputs()}
         self.step_outputs_info = {node.name: node.type for node in self.sess_gpt_step.get_outputs()}
@@ -134,8 +136,6 @@ class GPTSoVITS_ONNX_Inference:
         print(f"Detected model version: {self.version}")
 
         self.hps["model"]["semantic_frame_rate"] = "25hz"
-
-        self.sv_model = SV(device, False)
 
         # Detect Model Precision from GPT Encoder inputs
         self.precision = np.float32
@@ -199,10 +199,13 @@ class GPTSoVITS_ONNX_Inference:
                 "bert_feature": dummy_bert
             })
 
-            # SV Model Warmup (PyTorch)
-            print("  - Warming up SV model...")
-            dummy_wav_sv = torch.zeros((1, 16000), device=self.device)
-            self.sv_model.compute_embedding3(dummy_wav_sv)
+            print("  - Warming up spectrogram model...")
+            dummy_wav_spec = np.zeros((1, 48000), dtype=self.precision)
+            self.run_sess(self.sess_spectrogram, {"audio": dummy_wav_spec})
+
+            print("  - Warming up sv_embedding model...")
+            dummy_wav_sv = np.zeros((1, 16000), dtype=self.precision)
+            self.run_sess(self.sess_sv_embedding, {"audio": dummy_wav_sv})
 
             # SoVITS Warmup
             print("  - Warming up SoVITS...")
@@ -383,17 +386,12 @@ class GPTSoVITS_ONNX_Inference:
 
         # SoVITS Setup
         wav_ref, _ = librosa.load(ref_wav_path, sr=sr)
-        spec = spectrogram_torch(torch.from_numpy(wav_ref)[None, :], self.hps["data"]["filter_length"], self.hps["data"]["sampling_rate"],
-                                 self.hps["data"]["hop_length"], self.hps["data"]["win_length"], center=False).numpy()
+        wav_ref = wav_ref.astype(self.precision)
+        spec = self.run_sess(self.sess_spectrogram, {"audio": wav_ref[None, :]})[0]
 
         wav16k_sv, _ = librosa.load(ref_wav_path, sr=16000)
-        sv_emb = self.sv_model.compute_embedding3(torch.from_numpy(wav16k_sv)[None, :]).detach().cpu().numpy()
-
-        sv_size = 20480 if "Pro" in self.version else 512
-        if sv_emb.shape[-1] != sv_size:
-            tmp = np.zeros((1, sv_size), dtype=np.float32)
-            tmp[:, :min(sv_emb.shape[-1], sv_size)] = sv_emb[:, :min(sv_emb.shape[-1], sv_size)]
-            sv_emb = tmp
+        wav16k_sv = wav16k_sv.astype(self.precision)
+        sv_emb = self.run_sess(self.sess_sv_embedding, {"audio": wav16k_sv[None, :]})[0]
 
         #  Process Reference Text (Once)
         t_start = time.perf_counter()

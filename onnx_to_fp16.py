@@ -14,7 +14,9 @@ MODEL_CONFIGS = {
     "ssl": {"fp16": True, "sensitive": ["LayerNormalization", "Mean"]},
     "gpt_encoder": {"fp16": True, "sensitive": ["Pow", "Exp", "Mean", "ReduceMean", "LayerNormalization"]},
     "gpt_step": {"fp16": True, "sensitive": ["Pow", "Exp", "MatMulInteger", "LayerNormalization"]},
-    "sovits": {"fp16": True, "sensitive": ["InstanceNormalization", "Resize", "Mean", "Sum", "Exp"]},
+    "sovits": {"fp16": True, "sensitive": ["InstanceNormalization", "Resize", "Mean", "Sum", "Exp"], "native_sensitive": ["Resize"]},
+    "spectrogram": {"fp16": True, "sensitive": ["Sqrt", "Pow", "Mean", "ReduceMean", "Div"]},
+    "sv_embedding": {"fp16": True, "sensitive": ["LayerNormalization", "Mean", "ReduceMean", "Pow", "Sqrt", "Div"]},
 }
 
 # 全局通用黑名单
@@ -144,7 +146,7 @@ def fix_broken_attributes(model):
     return model
 
 
-def optimize_single_model(input_path, output_path):
+def optimize_single_model(input_path, output_path, native_fp16=False):
     filename = os.path.basename(input_path)
     model_name_key = None
 
@@ -157,21 +159,47 @@ def optimize_single_model(input_path, output_path):
     # 默认策略：如果不匹配（如 unknown.onnx），默认保持 FP32 以求稳
     config = MODEL_CONFIGS.get(model_name_key, {"fp16": False, "sensitive": []})
 
-    print(f"Processing: {filename} | Strategy: {'FP16' if config['fp16'] else 'FP32 (Keep)'}")
+    if native_fp16 and config["fp16"]:
+        strategy = "Native FP16 (All layers)"
+    else:
+        strategy = f"{'FP16 (Mixed)' if config['fp16'] else 'FP32 (Keep)'}"
+
+    print(f"Processing: {filename} | Strategy: {strategy}")
 
     model = onnx.load(input_path)
 
     # 如果启用 FP16，执行转换和修复
     if config["fp16"]:
         print("  Converting to FP16...")
-        block_list = GLOBAL_SENSITIVE_OPS + config["sensitive"]
-        model = convert_float_to_float16(
-            model,
-            keep_io_types=False,
-            op_block_list=block_list
-        )
-        # 仅在 FP16 模式下需要修复混合精度
-        model = fix_mixed_types_robust(model)
+
+        if native_fp16:
+            native_block_list = config.get("native_sensitive", [])
+            if native_block_list:
+                print(f"    [Native FP16] Converting all layers to FP16, but preserving {native_block_list}...")
+                model = convert_float_to_float16(
+                    model,
+                    keep_io_types=False,  # 输入输出也转换为 FP16
+                    op_block_list=native_block_list  # 保留特定的敏感操作为 FP32
+                )
+            else:
+                print("    [Native FP16] Converting all layers to FP16 (including I/O)...")
+                model = convert_float_to_float16(
+                    model,
+                    keep_io_types=False,  # 输入输出也转换为 FP16
+                    op_block_list=[]  # 不保留任何敏感操作
+                )
+        else:
+            # 混合精度模式：保留敏感操作为 FP32
+            block_list = GLOBAL_SENSITIVE_OPS + config["sensitive"]
+            model = convert_float_to_float16(
+                model,
+                keep_io_types=False,
+                op_block_list=block_list
+            )
+            # 仅在混合精度模式下需要修复类型不匹配
+            model = fix_mixed_types_robust(model)
+
+        # 修复属性（无论哪种 FP16 模式都需要）
         model = fix_broken_attributes(model)
     else:
         print("  Skipping FP16 conversion (Sensitivity/Low-Cost).")
@@ -187,13 +215,14 @@ def optimize_single_model(input_path, output_path):
     print(f"  Saved: {output_path}")
 
 import shutil
-def process_directory(input_dir, output_dir):
+def process_directory(input_dir, output_dir, native_fp16=False):
     os.makedirs(output_dir, exist_ok=True)
     for filename in os.listdir(input_dir):
         if filename.endswith(".onnx"):
             optimize_single_model(
                 os.path.join(input_dir, filename),
-                os.path.join(output_dir, filename)
+                os.path.join(output_dir, filename),
+                native_fp16=native_fp16
             )
             # 复制 .data 文件 (如果有)
             dfile = os.path.join(input_dir, filename + ".data")
@@ -205,8 +234,17 @@ def process_directory(input_dir, output_dir):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input_dir", required=True)
-    parser.add_argument("--output_dir", required=True)
+    parser = argparse.ArgumentParser(description="Convert ONNX models to FP16")
+    parser.add_argument("--input_dir", required=True, help="Input directory containing FP32 ONNX models")
+    parser.add_argument("--output_dir", required=True, help="Output directory for FP16 models")
+    parser.add_argument("--native_fp16", action="store_true", help="Use native FP16 mode (convert all layers to FP16, no mixed precision)")
     args = parser.parse_args()
-    process_directory(args.input_dir, args.output_dir)
+
+    if args.native_fp16:
+        print("=" * 60)
+        print("NATIVE FP16 MODE ENABLED")
+        print("All layers will be converted to FP16")
+        print("Note: This may cause numerical instability in some operations")
+        print("=" * 60)
+
+    process_directory(args.input_dir, args.output_dir, native_fp16=args.native_fp16)
