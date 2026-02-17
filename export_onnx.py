@@ -12,6 +12,10 @@ from GPT_SoVITS.AR.models.t2s_lightning_module import Text2SemanticLightningModu
 from GPT_SoVITS.module.models import SynthesizerTrn
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 import logging
+
+# ONNX校验
+import onnx_validation
+
 logging.getLogger("torch.onnx").setLevel(logging.WARN)
 logging.getLogger("onnx").setLevel(logging.WARN)
 logging.getLogger("onnx_ir").setLevel(logging.WARN)
@@ -168,12 +172,10 @@ class SpectrogramWrapper(nn.Module):
 class SVEmbeddingWrapper(nn.Module):
     """
     Wrapper for SV model compute_embedding3 to enable ONNX export.
-    Combines FBank feature extraction and ERes2NetV2 embedding model.
     """
     def __init__(self, sv_model):
         super().__init__()
         self.embedding_model = sv_model
-        # FBank parameters
         self.num_mel_bins = 80
         self.sample_frequency = 16000.0
         self.frame_length = 25.0  # ms
@@ -184,31 +186,78 @@ class SVEmbeddingWrapper(nn.Module):
         self.window_type = "povey"
         self.remove_dc_offset = True
         self.preemphasis_coefficient = 0.97
+        self.energy_floor = 1.0
+        self.raw_energy = True
 
-        # Pre-compute mel filter bank (ONNX compatible)
+        # Pre-compute window and mel filter bank (ONNX compatible)
         self.window_size = int(self.sample_frequency * self.frame_length * 0.001)
         self.window_shift = int(self.sample_frequency * self.frame_shift * 0.001)
         self.padded_window_size = 2 ** ((self.window_size - 1).bit_length())
         num_fft_bins = self.padded_window_size // 2 + 1
 
-        self.register_buffer("mel_filterbank", self._create_mel_filterbank(num_fft_bins))
+        # Pre-compute Povey window (Hanning window^0.85)
+        self.register_buffer("window", torch.hann_window(self.window_size) ** 0.85)
 
-    def _create_mel_filterbank(self, num_fft_bins):
+        self.register_buffer("mel_filterbank", self._create_mel_filterbank_kaldi(num_fft_bins))
+
+    def _create_mel_filterbank_kaldi(self, num_fft_bins):
+        """
+        Create mel filter bank matching Kaldi implementation.
+        Kaldi uses triangular mel filters with specific edge frequencies.
+        """
         import math
-        from librosa.filters import mel as librosa_mel_fn
 
         high_freq = self.high_freq
         if high_freq <= 0.0:
             high_freq = self.sample_frequency / 2.0
 
-        mel = librosa_mel_fn(
-            sr=self.sample_frequency,
-            n_fft=self.padded_window_size,
-            n_mels=self.num_mel_bins,
-            fmin=self.low_freq,
-            fmax=high_freq
-        )
-        return torch.from_numpy(mel).float()
+        # Mel scale conversion functions (matching Kaldi)
+        def mel_scale(freq):
+            return 1127.0 * math.log(1.0 + freq / 700.0)
+
+        def inverse_mel_scale(mel_freq):
+            return 700.0 * (math.exp(mel_freq / 1127.0) - 1.0)
+
+        # Calculate mel frequencies
+        mel_low_freq = mel_scale(self.low_freq)
+        mel_high_freq = mel_scale(high_freq)
+
+        # Divide by num_bins+1 due to end-effects where bins spread to sides
+        mel_freq_delta = (mel_high_freq - mel_low_freq) / (self.num_mel_bins + 1)
+
+        # Create mel filter bank
+        bins = torch.zeros(self.num_mel_bins, num_fft_bins)
+
+        # FFT bin width
+        fft_bin_width = self.sample_frequency / self.padded_window_size
+
+        # For each mel bin
+        for i in range(self.num_mel_bins):
+            # Calculate left, center, right mel frequencies
+            left_mel = mel_low_freq + i * mel_freq_delta
+            center_mel = mel_low_freq + (i + 1.0) * mel_freq_delta
+            right_mel = mel_low_freq + (i + 2.0) * mel_freq_delta
+
+            # Convert to Hz
+            left_hz = inverse_mel_scale(left_mel)
+            center_hz = inverse_mel_scale(center_mel)
+            right_hz = inverse_mel_scale(right_mel)
+
+            # Calculate which FFT bins these correspond to
+            left_bin = int(round(left_hz / fft_bin_width))
+            center_bin = int(round(center_hz / fft_bin_width))
+            right_bin = int(round(right_hz / fft_bin_width))
+
+            # Create triangular filter
+            # Left slope: from left_bin to center_bin
+            if center_bin > left_bin:
+                bins[i, left_bin:center_bin] = torch.linspace(0, 1, center_bin - left_bin)
+
+            # Right slope: from center_bin to right_bin
+            if right_bin > center_bin:
+                bins[i, center_bin:right_bin] = torch.linspace(1, 0, right_bin - center_bin)
+
+        return bins
 
     def forward(self, wav):
         # wav: [B, T] audio waveform at 16kHz
@@ -216,59 +265,41 @@ class SVEmbeddingWrapper(nn.Module):
         device = wav.device
         dtype = wav.dtype
 
-        # Extract FBank features using STFT directly (ONNX compatible)
-        # Pre-emphasis
-        if self.preemphasis_coefficient != 0.0:
-            wav = wav - self.preemphasis_coefficient * torch.nn.functional.pad(wav, (1, 0), mode="replicate")[:, :-1]
-
-        # Pad for STFT (same padding as kaldi)
-        pad = self.window_size // 2 - self.window_shift // 2
-        if pad > 0:
-            wav_padded = torch.nn.functional.pad(wav, (pad, pad), mode="reflect")
-        else:
-            wav_padded = torch.cat((wav[:, -pad:], wav, wav[:, :pad]), dim=1)
-
-        # Create Povey window (Hanning window^0.85)
-        window = torch.hann_window(self.window_size, device=device, dtype=dtype) ** 0.85
-
-        # Compute STFT
-        stft_output = torch.stft(
-            wav_padded,
+        # Use STFT directly (ONNX compatible) to extract frames and compute FFT
+        # STFT will handle framing, windowing, and FFT in one operation
+        stft_result = torch.stft(
+            wav,
             n_fft=self.padded_window_size,
             hop_length=self.window_shift,
             win_length=self.window_size,
-            window=window,
-            center=False,
-            pad_mode="reflect",
+            window=self.window.to(device=device, dtype=dtype),
+            center=False,  # Kaldi doesn't center
             normalized=False,
             onesided=True,
             return_complex=False
-        )
-        # stft_output: [B, padded_window_size//2+1, num_frames, 2]
+        )  # [B, num_freq_bins, num_frames, 2]
 
-        # Compute power spectrum
-        spectrum = torch.sqrt(stft_output.pow(2).sum(-1) + 1e-8).pow(2.0)
-        # spectrum: [B, num_fft_bins, num_frames]
+        # Extract real and imag parts
+        real_part = stft_result[:, :, :, 0]  # [B, num_freq_bins, num_frames]
+        imag_part = stft_result[:, :, :, 1]  # [B, num_freq_bins, num_frames]
 
-        # Remove DC offset per frame
-        if self.remove_dc_offset:
-            spectrum = spectrum - spectrum.mean(dim=1, keepdim=True)
+        # Compute power spectrum: [B, num_freq_bins, num_frames]
+        spectrum = real_part.pow(2) + imag_part.pow(2)
 
-        # Transpose for mel filter bank: [B, num_frames, num_fft_bins]
-        spectrum_t = spectrum.transpose(1, 2)
+        # Transpose to [B, num_frames, num_freq_bins] for mel filter bank
+        spectrum = spectrum.transpose(1, 2)  # [B, num_frames, num_freq_bins]
 
         # Apply mel filter bank
+        # spectrum: [B, num_frames, num_fft_bins]
         # mel_filterbank: [num_mel_bins, num_fft_bins]
-        # spectrum_t: [B, num_frames, num_fft_bins]
         # result: [B, num_frames, num_mel_bins]
-        mel_energies = torch.matmul(spectrum_t, self.mel_filterbank.T)
+        mel_energies = torch.matmul(spectrum, self.mel_filterbank.T)
 
         # Log compression
-        epsilon = torch.finfo(spectrum.dtype).eps
-        mel_energies = torch.max(mel_energies, torch.tensor(epsilon, device=device, dtype=dtype)).log()
+        epsilon_tensor = torch.tensor(torch.finfo(dtype).eps, device=device, dtype=dtype)
+        mel_energies = torch.clamp_min(mel_energies, epsilon_tensor).log()
 
         # mel_energies: [B, T, F] where F=80 (already in correct format)
-        # No permute needed
         feat = mel_energies
 
         # Pass through ERes2NetV2 forward3
@@ -290,7 +321,18 @@ def hparams_to_dict(hp):
 def export_onnx(args):
     torch.set_grad_enabled(False)
     device = "cpu" # Export on CPU usually safer for dynamic axes
-    
+
+    # 初始化校验器（如果启用）
+    validator = None
+    if args.validate:
+        print(f"\n{'='*60}")
+        print("启用ONNX导出精度校验")
+        print(f"{'='*60}\n")
+        validator = onnx_validation.ONNXValidator(
+            output_dir=args.output_dir,
+            onnx_device=args.validation_device
+        )
+
     print("Loading models...")
     # SSL
     cnhubert.cnhubert_base_path = args.cnhubert_base_path
@@ -383,6 +425,18 @@ def export_onnx(args):
         opset_version=18,
         dynamo=False
     )
+
+    # 校验SSL模型
+    if validator:
+        validator.validate_model(
+            model_name="SSL",
+            onnx_path=f"{output_dir}/ssl.onnx",
+            pytorch_model=ssl_wrapper,
+            dummy_inputs={"audio": dummy_audio},
+            output_names=["last_hidden_state"],
+            rtol=1e-3,
+            atol=1e-5
+        )
     
     print("Exporting BERT...")
     # Input: input_ids [1, T], attention_mask [1, T], token_type_ids [1, T]
@@ -409,6 +463,22 @@ def export_onnx(args):
         opset_version=20,
         dynamo=False
     )
+
+    # 校验BERT模型
+    if validator:
+        validator.validate_model(
+            model_name="BERT",
+            onnx_path=f"{output_dir}/bert.onnx",
+            pytorch_model=bert_wrapper,
+            dummy_inputs={
+                "input_ids": dummy_input_ids,
+                "attention_mask": dummy_attn_mask,
+                "token_type_ids": dummy_token_type
+            },
+            output_names=["hidden_states"],
+            rtol=1e-3,
+            atol=1e-5
+        )
     
     print("Exporting VQEncoder...")
     vq_enc = VQEncoder(vq_model)
@@ -424,6 +494,18 @@ def export_onnx(args):
         opset_version=20,
         dynamo=False
     )
+
+    # 校验VQEncoder模型
+    if validator:
+        validator.validate_model(
+            model_name="VQEncoder",
+            onnx_path=f"{output_dir}/vq_encoder.onnx",
+            pytorch_model=vq_enc,
+            dummy_inputs={"ssl_content": dummy_ssl},
+            output_names=["codes"],
+            rtol=1e-3,
+            atol=1e-5
+        )
 
     print("Exporting GPT Encoder...")
     gpt_enc = GPTEncoder(t2s_model, max_len=args.max_len)
@@ -543,6 +625,18 @@ def export_onnx(args):
         dynamo=False
     )
 
+    # 校验Spectrogram模型
+    if validator:
+        validator.validate_model(
+            model_name="Spectrogram",
+            onnx_path=f"{output_dir}/spectrogram.onnx",
+            pytorch_model=spec_wrapper,
+            dummy_inputs={"audio": dummy_wav},
+            output_names=["spectrogram"],
+            rtol=1e-4,
+            atol=1e-6
+        )
+
     # Export SVEmbeddingWrapper
     print("Exporting SV Embedding...")
     sv_wrapper = SVEmbeddingWrapper(sv_model)
@@ -559,6 +653,18 @@ def export_onnx(args):
         dynamo=False
     )
 
+    # 校验SVEmbedding模型
+    if validator:
+        validator.validate_model(
+            model_name="SVEmbedding",
+            onnx_path=f"{output_dir}/sv_embedding.onnx",
+            pytorch_model=sv_wrapper,
+            dummy_inputs={"audio": dummy_wav_16k},
+            output_names=["sv_embedding"],
+            rtol=1e-3,
+            atol=1e-5
+        )
+
     config_dict = hparams_to_dict(hps)
     config_dict["symbol_to_id"] = _symbol_to_id_v2
     config_dict["spectrogram"] = {
@@ -574,8 +680,13 @@ def export_onnx(args):
     }
     with open(f"{output_dir}/config.json", "w", encoding="utf-8") as f:
         json.dump(config_dict, f, indent=4, ensure_ascii=False)
-    
+
     print(f"Export complete! Config saved to {output_dir}/config.json")
+
+    # 校验摘要
+    if validator:
+        validator.print_summary()
+        validator.save_report()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GPT-SoVITS ONNX Export")
@@ -586,11 +697,13 @@ if __name__ == "__main__":
     parser.add_argument("--sv_path", default=None, help="Path to SV model (default: pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt)")
     parser.add_argument("--max_len", type=int, default=2000, help="Pre-allocated KV cache length")
     parser.add_argument("--output_dir", default="onnx_export", help="Output directory for ONNX models")
-    
+    parser.add_argument("--validate", action="store_true", help="Enable ONNX export accuracy validation")
+    parser.add_argument("--validation_device", default="cpu", choices=["cpu", "cuda"], help="Device for ONNX validation (default: cpu)")
+
     args = parser.parse_args()
-    
+
     # Set SV model path if provided
     if args.sv_path:
         os.environ["SV_MODEL_PATH"] = args.sv_path
-    
+
     export_onnx(args)
