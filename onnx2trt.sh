@@ -58,3 +58,19 @@ trtexec --fp16 \
     --optShapes=ssl_content:1x768x500 \
     --maxShapes=ssl_content:1x768x5000 \
     --memPoolSize=workspace:2048M
+
+trtexec --fp16 \
+    --onnx="${INPUT_DIR}/spectrogram.onnx" \
+    --saveEngine="${OUTPUT_DIR}/spectrogram.engine" \
+    --minShapes=audio:1x1 \
+    --optShapes=audio:1x48000 \
+    --maxShapes=audio:1x960000 \
+    --memPoolSize=workspace:2048M
+
+trtexec --fp16 \
+    --onnx="${INPUT_DIR}/sv_embedding.onnx" \
+    --saveEngine="${OUTPUT_DIR}/sv_embedding.engine" \
+    --minShapes=audio:1x16000 \
+    --optShapes=audio:1x48000 \
+    --maxShapes=audio:1x160000 \
+    --memPoolSize=workspace:2048M

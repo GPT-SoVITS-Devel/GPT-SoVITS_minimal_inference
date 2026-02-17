@@ -19,8 +19,6 @@ sys.path.append(os.path.join(cwd, "GPT_SoVITS"))
 from GPT_SoVITS.text.LangSegmenter import LangSegmenter
 from GPT_SoVITS.text import cleaned_text_to_sequence
 from GPT_SoVITS.text.cleaner import clean_text
-from GPT_SoVITS.module.mel_processing import spectrogram_torch
-from GPT_SoVITS.sv import SV
 
 def split_text(text):
     text = text.strip("\n")
@@ -220,6 +218,8 @@ class GPTSoVITS_TRT_Inference:
         self.model_gpt_enc = TRTModule(f"{trt_dir}/gpt_encoder.engine", device, self.stream)
         self.model_gpt_step = TRTModule(f"{trt_dir}/gpt_step.engine", device, self.stream)
         self.model_sovits = TRTModule(f"{trt_dir}/sovits.engine", device, self.stream)
+        self.model_spectrogram = TRTModule(f"{trt_dir}/spectrogram.engine", device, self.stream)
+        self.model_sv_embedding = TRTModule(f"{trt_dir}/sv_embedding.engine", device, self.stream)
 
         self.tokenizer = AutoTokenizer.from_pretrained(bert_path)
         
@@ -235,8 +235,6 @@ class GPTSoVITS_TRT_Inference:
         print(f"Detected model version: {self.version}")
 
         self.hps["model"]["semantic_frame_rate"] = "25hz"
-
-        self.sv_model = SV(device, False)
 
         # Detect precision from gpt_encoder engine as a proxy
         gpt_enc_dtype = self.model_gpt_enc.tensor_dtype["bert_feature"]
@@ -283,10 +281,18 @@ class GPTSoVITS_TRT_Inference:
             sv_size = 20480 if "Pro" in self.version else 512
             dummy_emb = torch.zeros((1, sv_size), dtype=self.precision, device=self.device)
             self.model_sovits({
-                "pred_semantic": dummy_sem, "text_seq": dummy_seq, "refer_spec": dummy_spec, 
-                "sv_emb": dummy_emb, "noise_scale": torch.tensor([0.5], device=self.device), 
+                "pred_semantic": dummy_sem, "text_seq": dummy_seq, "refer_spec": dummy_spec,
+                "sv_emb": dummy_emb, "noise_scale": torch.tensor([0.5], device=self.device),
                 "speed": torch.tensor([1.0], device=self.device)
             })
+
+            print("  - Warming up spectrogram model...")
+            dummy_wav_spec = torch.zeros((1, 48000), device=self.device, dtype=self.precision)
+            self.model_spectrogram({"audio": dummy_wav_spec})
+
+            print("  - Warming up sv_embedding model...")
+            dummy_wav_sv = torch.zeros((1, 16000), device=self.device, dtype=self.precision)
+            self.model_sv_embedding({"audio": dummy_wav_sv})
         except Exception as e:
             print(f"Warmup warning (some engines might have strict shapes): {e}")
             
@@ -431,11 +437,10 @@ class GPTSoVITS_TRT_Inference:
 
             # SoVITS Setup
             wav_ref, _ = librosa.load(ref_wav_path, sr=sr)
-            spec = spectrogram_torch(torch.from_numpy(wav_ref)[None, :], self.hps["data"]["filter_length"], self.hps["data"]["sampling_rate"],
-                                     self.hps["data"]["hop_length"], self.hps["data"]["win_length"], center=False).to(self.device).to(self.precision)
+            spec = self.model_spectrogram({"audio": torch.from_numpy(wav_ref)[None, :].to(self.device).to(self.precision)})["spectrogram"]
 
             wav16k_sv, _ = librosa.load(ref_wav_path, sr=16000)
-            sv_emb = self.sv_model.compute_embedding3(torch.from_numpy(wav16k_sv).to(self.device)[None, :]).detach()
+            sv_emb = self.model_sv_embedding({"audio": torch.from_numpy(wav16k_sv)[None, :].to(self.device).to(self.precision)})["sv_embedding"]
 
             sv_size = 20480 if "Pro" in self.version else 512
             if sv_emb.shape[-1] != sv_size:

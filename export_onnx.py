@@ -145,9 +145,12 @@ class SpectrogramWrapper(nn.Module):
         hop_size = self.hop_length
         win_size = self.win_length
 
+        # Convert to float32 for STFT (TensorRT requires float32 input for STFT)
+        y_stft = y.to(torch.float32)
+
         # Pad audio for STFT
         y_padded = torch.nn.functional.pad(
-            y.unsqueeze(1), (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)), mode="reflect"
+            y_stft.unsqueeze(1), (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)), mode="reflect"
         )
         y_padded = y_padded.squeeze(1)
 
@@ -157,7 +160,7 @@ class SpectrogramWrapper(nn.Module):
             n_fft,
             hop_length=hop_size,
             win_length=win_size,
-            window=self.hann_window,
+            window=self.hann_window.to(torch.float32),
             center=False,
             pad_mode="reflect",
             normalized=False,
@@ -265,14 +268,17 @@ class SVEmbeddingWrapper(nn.Module):
         device = wav.device
         dtype = wav.dtype
 
+        # Convert to float32 for STFT (TensorRT requires float32 input for STFT)
+        wav_stft = wav.to(torch.float32)
+
         # Use STFT directly (ONNX compatible) to extract frames and compute FFT
         # STFT will handle framing, windowing, and FFT in one operation
         stft_result = torch.stft(
-            wav,
+            wav_stft,
             n_fft=self.padded_window_size,
             hop_length=self.window_shift,
             win_length=self.window_size,
-            window=self.window.to(device=device, dtype=dtype),
+            window=self.window.to(device=device, dtype=torch.float32),
             center=False,  # Kaldi doesn't center
             normalized=False,
             onesided=True,
@@ -296,7 +302,7 @@ class SVEmbeddingWrapper(nn.Module):
         mel_energies = torch.matmul(spectrum, self.mel_filterbank.T)
 
         # Log compression
-        epsilon_tensor = torch.tensor(torch.finfo(dtype).eps, device=device, dtype=dtype)
+        epsilon_tensor = torch.tensor(torch.finfo(torch.float32).eps, device=device, dtype=torch.float32)
         mel_energies = torch.clamp_min(mel_energies, epsilon_tensor).log()
 
         # mel_energies: [B, T, F] where F=80 (already in correct format)

@@ -15,8 +15,9 @@ MODEL_CONFIGS = {
     "gpt_encoder": {"fp16": True, "sensitive": ["Pow", "Exp", "Mean", "ReduceMean", "LayerNormalization"]},
     "gpt_step": {"fp16": True, "sensitive": ["Pow", "Exp", "MatMulInteger", "LayerNormalization"]},
     "sovits": {"fp16": True, "sensitive": ["InstanceNormalization", "Resize", "Mean", "Sum", "Exp"], "native_sensitive": ["Resize"]},
-    "spectrogram": {"fp16": True, "sensitive": ["Sqrt", "Pow", "Mean", "ReduceMean", "Div"]},
-    "sv_embedding": {"fp16": True, "sensitive": ["LayerNormalization", "Mean", "ReduceMean", "Pow", "Sqrt", "Div"]},
+    # spectrogram 和 sv_embedding 的 STFT 需要 FP32 输入，所以输入保持 FP32
+    "spectrogram": {"fp16": True, "sensitive": ["Sqrt", "Pow", "Mean", "ReduceMean", "Div"], "keep_input_types": True},
+    "sv_embedding": {"fp16": True, "sensitive": ["LayerNormalization", "Mean", "ReduceMean", "Pow", "Sqrt", "Div"], "keep_input_types": True},
 }
 
 # 全局通用黑名单
@@ -160,9 +161,12 @@ def optimize_single_model(input_path, output_path, native_fp16=False):
     config = MODEL_CONFIGS.get(model_name_key, {"fp16": False, "sensitive": []})
 
     if native_fp16 and config["fp16"]:
-        strategy = "Native FP16 (All layers)"
+        keep_io = config.get("keep_input_types", False)
+        strategy = f"Native FP16 (I/O: {'FP32' if keep_io else 'FP16'})"
     else:
-        strategy = f"{'FP16 (Mixed)' if config['fp16'] else 'FP32 (Keep)'}"
+        keep_io = config.get("keep_input_types", False)
+        io_status = "FP32 Input" if keep_io else "FP16"
+        strategy = f"{'FP16 (Mixed)' if config['fp16'] else 'FP32 (Keep)'} [{io_status}]"
 
     print(f"Processing: {filename} | Strategy: {strategy}")
 
@@ -174,26 +178,28 @@ def optimize_single_model(input_path, output_path, native_fp16=False):
 
         if native_fp16:
             native_block_list = config.get("native_sensitive", [])
+            keep_io = config.get("keep_input_types", False)
             if native_block_list:
                 print(f"    [Native FP16] Converting all layers to FP16, but preserving {native_block_list}...")
                 model = convert_float_to_float16(
                     model,
-                    keep_io_types=False,  # 输入输出也转换为 FP16
+                    keep_io_types=keep_io,  # 根据 keep_input_types 配置决定是否转换 I/O
                     op_block_list=native_block_list  # 保留特定的敏感操作为 FP32
                 )
             else:
-                print("    [Native FP16] Converting all layers to FP16 (including I/O)...")
+                print(f"    [Native FP16] Converting all layers to FP16 (I/O: {'FP32' if keep_io else 'FP16'})...")
                 model = convert_float_to_float16(
                     model,
-                    keep_io_types=False,  # 输入输出也转换为 FP16
+                    keep_io_types=keep_io,  # 根据 keep_input_types 配置决定是否转换 I/O
                     op_block_list=[]  # 不保留任何敏感操作
                 )
         else:
             # 混合精度模式：保留敏感操作为 FP32
             block_list = GLOBAL_SENSITIVE_OPS + config["sensitive"]
+            keep_io = config.get("keep_input_types", False)
             model = convert_float_to_float16(
                 model,
-                keep_io_types=False,
+                keep_io_types=keep_io,  # 根据 keep_input_types 配置决定是否转换 I/O
                 op_block_list=block_list
             )
             # 仅在混合精度模式下需要修复类型不匹配
