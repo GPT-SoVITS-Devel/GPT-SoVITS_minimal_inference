@@ -241,7 +241,7 @@ class GPTSoVITS_ONNX_Streaming_Inference:
             )
         return bert
 
-    def get_phones_and_bert(self, text, language, version):
+    def get_phones_and_bert(self, text, language, version, default_lang=None):
         text = re.sub(r' {2,}', ' ', text)
         textlist = []
         langlist = []
@@ -267,11 +267,11 @@ class GPTSoVITS_ONNX_Streaming_Inference:
             langlist.append("en")
             textlist.append(text)
         elif language == "auto":
-            for tmp in LangSegmenter.getTexts(text):
+            for tmp in LangSegmenter.getTexts(text, default_lang=default_lang):
                 langlist.append(tmp["lang"])
                 textlist.append(tmp["text"])
         elif language == "auto_yue":
-            for tmp in LangSegmenter.getTexts(text):
+            for tmp in LangSegmenter.getTexts(text, default_lang=default_lang):
                 if tmp["lang"] == "zh":
                     tmp["lang"] = "yue"
                 langlist.append(tmp["lang"])
@@ -369,7 +369,7 @@ class GPTSoVITS_ONNX_Streaming_Inference:
 
         for seg_idx, seg_text in enumerate(segments):
             print(f"Processing segment {seg_idx+1}/{len(segments)}: {seg_text}")
-            curr_phones, curr_bert, _ = self.get_phones_and_bert(seg_text, text_lang, self.version)
+            curr_phones, curr_bert, _ = self.get_phones_and_bert(seg_text, text_lang, self.version, default_lang=prompt_lang)
             bert = np.concatenate([ref_bert, curr_bert], axis=1)[None, :, :]
             all_phones = np.array(ref_phones + curr_phones, dtype=np.int64)[None, :]
             

@@ -37,11 +37,14 @@ class GPTEncoder(nn.Module):
         self.t2s_model = t2s_model
         self.max_len = max_len
 
-    def forward(self, phoneme_ids, phoneme_ids_len, prompts, bert_feature):
+    def forward(self, phoneme_ids, prompts, bert_feature):
         # Wrapper for infer_first_stage
         # Returns: logits, k_cache (stacked), v_cache (stacked), x_len, y_len
+        
+        actual_len = phoneme_ids.shape[1]
+        
         logits, k_cache, v_cache, x_len, y_len = self.t2s_model.model.infer_first_stage(
-            phoneme_ids, phoneme_ids_len, prompts, bert_feature
+            phoneme_ids, prompts, bert_feature
         )
         
         # Stack caches: List[Tensor] -> Tensor [Layers, B, T, D]
@@ -533,9 +536,9 @@ def export_onnx(args):
     
     torch.onnx.export(
         gpt_enc,
-        (phoneme_ids, phoneme_ids_len, prompts, bert_feature),
+        (phoneme_ids, prompts, bert_feature),
         f"{output_dir}/gpt_encoder.onnx",
-        input_names=["phoneme_ids", "phoneme_ids_len", "prompts", "bert_feature"],
+        input_names=["phoneme_ids", "prompts", "bert_feature"],
         output_names=["topk_values", "topk_indices", "k_cache", "v_cache", "x_len", "y_len"],
         dynamic_axes=dynamic_axes_gpt,
         opset_version=20,
@@ -545,7 +548,7 @@ def export_onnx(args):
     print("Exporting GPT Step...")
     # Get outputs from encoder to feed to step
     with torch.no_grad():
-        topk_v_dummy, topk_i_dummy, k_cache, v_cache, x_len, y_len = gpt_enc(phoneme_ids, phoneme_ids_len, prompts, bert_feature)
+        topk_v_dummy, topk_i_dummy, k_cache, v_cache, x_len, y_len = gpt_enc(phoneme_ids, prompts, bert_feature)
     
     gpt_step = GPTStep(t2s_model)
     idx = torch.tensor([0], dtype=torch.long)
@@ -679,7 +682,7 @@ def export_onnx(args):
         "win_length": hps_obj.data.win_length,
         "sampling_rate": hps_obj.data.sampling_rate
     }
-
+    config_dict["data"]['max_len'] = args.max_len
     config_dict["sv_embedding"] = {
         "embedding_size": 20480 if "Pro" in model_version else 512,
         "model_version": model_version

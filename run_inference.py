@@ -229,7 +229,7 @@ class GPTSoVITSInference:
 
         return bert
 
-    def get_phones_and_bert(self, text, language, version):
+    def get_phones_and_bert(self, text, language, version, default_lang=None):
         import re
         text = re.sub(r' {2,}', ' ', text)
         textlist = []
@@ -256,11 +256,11 @@ class GPTSoVITSInference:
             langlist.append("en")
             textlist.append(text)
         elif language == "auto":
-            for tmp in LangSegmenter.getTexts(text):
+            for tmp in LangSegmenter.getTexts(text, default_lang=default_lang):
                 langlist.append(tmp["lang"])
                 textlist.append(tmp["text"])
         elif language == "auto_yue":
-            for tmp in LangSegmenter.getTexts(text):
+            for tmp in LangSegmenter.getTexts(text, default_lang=default_lang):
                 if tmp["lang"] == "zh":
                     tmp["lang"] = "yue"
                 langlist.append(tmp["lang"])
@@ -378,7 +378,7 @@ class GPTSoVITSInference:
 
             # Process Text Segment
             t_seg_text_start = time.perf_counter()
-            phones2, bert2, norm_text2 = self.get_phones_and_bert(seg, text_lang, self.hps.model.version)
+            phones2, bert2, norm_text2 = self.get_phones_and_bert(seg, text_lang, self.hps.model.version, default_lang=prompt_lang)
             if self.device == "cuda": torch.cuda.synchronize()
             t_seg_text_end = time.perf_counter()
             total_text_time += (t_seg_text_end - t_seg_text_start)

@@ -1009,7 +1009,6 @@ class Text2SemanticDecoder(nn.Module):
     def infer_first_stage(
         self,
         x: torch.LongTensor,
-        x_lens: torch.LongTensor,
         prompts: torch.LongTensor,
         bert_feature: torch.LongTensor,
     ):

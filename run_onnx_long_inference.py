@@ -225,7 +225,7 @@ class GPTSoVITS_ONNX_Long_Inference:
             )
         return bert
 
-    def get_phones_and_bert(self, text, language, version):
+    def get_phones_and_bert(self, text, language, version, default_lang=None):
         import re
         text = re.sub(r' {2,}', ' ', text)
         textlist = []
@@ -252,11 +252,11 @@ class GPTSoVITS_ONNX_Long_Inference:
             langlist.append("en")
             textlist.append(text)
         elif language == "auto":
-            for tmp in LangSegmenter.getTexts(text):
+            for tmp in LangSegmenter.getTexts(text, default_lang=default_lang):
                 langlist.append(tmp["lang"])
                 textlist.append(tmp["text"])
         elif language == "auto_yue":
-            for tmp in LangSegmenter.getTexts(text):
+            for tmp in LangSegmenter.getTexts(text, default_lang=default_lang):
                 if tmp["lang"] == "zh":
                     tmp["lang"] = "yue"
                 langlist.append(tmp["lang"])
@@ -345,7 +345,7 @@ class GPTSoVITS_ONNX_Long_Inference:
         for i, seg_text in enumerate(segments):
             # Text segment
             t_start = time.perf_counter()
-            curr_phones, curr_bert, _ = self.get_phones_and_bert(seg_text, text_lang, self.version)
+            curr_phones, curr_bert, _ = self.get_phones_and_bert(seg_text, text_lang, self.version, default_lang=prompt_lang)
             if i == 0:
                 inp_phones, inp_bert, inp_prompt = ref_phones + curr_phones, np.concatenate([ref_bert, curr_bert], 1), prompt_semantic
             else:

@@ -154,7 +154,7 @@ class GPTSoVITSLongInference:
         # SV Model
         self.sv_model = SV(device, is_half)
 
-    def get_phones_and_bert(self, text, language, version):
+    def get_phones_and_bert(self, text, language, version, default_lang=None):
         text = re.sub(r' {2,}', ' ', text)
         textlist = []
         langlist = []
@@ -179,11 +179,11 @@ class GPTSoVITSLongInference:
             langlist.append("en")
             textlist.append(text)
         elif language == "auto":
-            for tmp in LangSegmenter.getTexts(text):
+            for tmp in LangSegmenter.getTexts(text, default_lang=default_lang):
                 langlist.append(tmp["lang"])
                 textlist.append(tmp["text"])
         elif language == "auto_yue":
-            for tmp in LangSegmenter.getTexts(text):
+            for tmp in LangSegmenter.getTexts(text, default_lang=default_lang):
                 if tmp["lang"] == "zh": tmp["lang"] = "yue"
                 langlist.append(tmp["lang"])
                 textlist.append(tmp["text"])
@@ -287,7 +287,7 @@ class GPTSoVITSLongInference:
                 print(f"Processing segment {i+1}/{len(segments)}: {seg_text[:30]}...")
                 
                 # Process Current Segment Text
-                curr_phones, curr_bert = self.get_phones_and_bert(seg_text, text_lang, self.hps.model.version)
+                curr_phones, curr_bert = self.get_phones_and_bert(seg_text, text_lang, self.hps.model.version, default_lang=prompt_lang)
                 
                 # Prepare GPT Input
                 if i == 0:

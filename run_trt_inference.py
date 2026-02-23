@@ -332,7 +332,7 @@ class GPTSoVITS_TRT_Inference:
             )
         return bert
 
-    def get_phones_and_bert(self, text, language, version):
+    def get_phones_and_bert(self, text, language, version, default_lang=None):
         import re
         text = re.sub(r' {2,}', ' ', text)
         textlist = []
@@ -359,11 +359,11 @@ class GPTSoVITS_TRT_Inference:
             langlist.append("en")
             textlist.append(text)
         elif language == "auto":
-            for tmp in LangSegmenter.getTexts(text):
+            for tmp in LangSegmenter.getTexts(text, default_lang=default_lang):
                 langlist.append(tmp["lang"])
                 textlist.append(tmp["text"])
         elif language == "auto_yue":
-            for tmp in LangSegmenter.getTexts(text):
+            for tmp in LangSegmenter.getTexts(text, default_lang=default_lang):
                 if tmp["lang"] == "zh":
                     tmp["lang"] = "yue"
                 langlist.append(tmp["lang"])
@@ -460,7 +460,7 @@ class GPTSoVITS_TRT_Inference:
                 
                 # Text Segment
                 t_seg_start = time.perf_counter()
-                phones2, bert2, norm_text2 = self.get_phones_and_bert(seg, text_lang, self.version)
+                phones2, bert2, norm_text2 = self.get_phones_and_bert(seg, text_lang, self.version, default_lang=prompt_lang)
                 bert = torch.cat([bert1, bert2], dim=1)[None, :, :].to(self.precision)
                 all_phoneme_ids = torch.tensor(phones1 + phones2, dtype=torch.int64, device=self.device)[None, :]
                 all_phoneme_len = torch.tensor([all_phoneme_ids.shape[1]], dtype=torch.int64, device=self.device)

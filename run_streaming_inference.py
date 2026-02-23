@@ -140,7 +140,7 @@ class GPTSoVITSStreamingInference:
         # SV Model
         self.sv_model = SV(device, is_half)
 
-    def get_phones_and_bert(self, text, language, version):
+    def get_phones_and_bert(self, text, language, version, default_lang=None):
         import re
         text = re.sub(r' {2,}', ' ', text)
         textlist = []
@@ -166,11 +166,11 @@ class GPTSoVITSStreamingInference:
             langlist.append("en")
             textlist.append(text)
         elif language == "auto":
-            for tmp in LangSegmenter.getTexts(text):
+            for tmp in LangSegmenter.getTexts(text, default_lang=default_lang):
                 langlist.append(tmp["lang"])
                 textlist.append(tmp["text"])
         elif language == "auto_yue":
-            for tmp in LangSegmenter.getTexts(text):
+            for tmp in LangSegmenter.getTexts(text, default_lang=default_lang):
                 if tmp["lang"] == "zh": tmp["lang"] = "yue"
                 langlist.append(tmp["lang"])
                 textlist.append(tmp["text"])
@@ -263,7 +263,7 @@ class GPTSoVITSStreamingInference:
             for seg_idx, seg_text in enumerate(segments):
                 print(f"Processing segment {seg_idx+1}/{len(segments)}: {seg_text}")
                 # Process Text Segment
-                phones2, bert2 = self.get_phones_and_bert(seg_text, text_lang, self.hps.model.version)
+                phones2, bert2 = self.get_phones_and_bert(seg_text, text_lang, self.hps.model.version, default_lang=prompt_lang)
                 bert = torch.cat([bert1, bert2], 1).unsqueeze(0).to(self.device)
                 all_phones = torch.LongTensor(phones1 + phones2).to(self.device).unsqueeze(0)
                 all_phones_len = torch.tensor([all_phones.shape[-1]]).to(self.device)

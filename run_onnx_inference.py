@@ -194,7 +194,6 @@ class GPTSoVITS_ONNX_Inference:
             dummy_len = np.array([256], dtype=np.int64)
             self.run_sess(self.sess_gpt_enc, {
                 "phoneme_ids": dummy_phones,
-                "phoneme_ids_len": dummy_len,
                 "prompts": dummy_prompt,
                 "bert_feature": dummy_bert
             })
@@ -277,7 +276,7 @@ class GPTSoVITS_ONNX_Inference:
             )
         return bert
 
-    def get_phones_and_bert(self, text, language, version):
+    def get_phones_and_bert(self, text, language, version, default_lang=None):
         import re
         text = re.sub(r' {2,}', ' ', text)
         textlist = []
@@ -304,11 +303,11 @@ class GPTSoVITS_ONNX_Inference:
             langlist.append("en")
             textlist.append(text)
         elif language == "auto":
-            for tmp in LangSegmenter.getTexts(text):
+            for tmp in LangSegmenter.getTexts(text, default_lang=default_lang):
                 langlist.append(tmp["lang"])
                 textlist.append(tmp["text"])
         elif language == "auto_yue":
-            for tmp in LangSegmenter.getTexts(text):
+            for tmp in LangSegmenter.getTexts(text, default_lang=default_lang):
                 if tmp["lang"] == "zh":
                     tmp["lang"] = "yue"
                 langlist.append(tmp["lang"])
@@ -403,7 +402,7 @@ class GPTSoVITS_ONNX_Inference:
             
             # Text Segment
             t_seg_start = time.perf_counter()
-            phones2, bert2, norm_text2 = self.get_phones_and_bert(seg, text_lang, self.version)
+            phones2, bert2, norm_text2 = self.get_phones_and_bert(seg, text_lang, self.version, default_lang=prompt_lang)
             bert = np.concatenate([bert1, bert2], axis=1)[None, :, :].astype(self.precision)
             all_phoneme_ids = np.array(phones1 + phones2, dtype=np.int64)[None, :]
             all_phoneme_len = np.array([all_phoneme_ids.shape[1]], dtype=np.int64)
@@ -413,7 +412,6 @@ class GPTSoVITS_ONNX_Inference:
             t_enc_start = time.perf_counter()
             topk_values, topk_indices, k_cache, v_cache, x_len, y_len = self.run_sess(self.sess_gpt_enc, {
                 "phoneme_ids": all_phoneme_ids,
-                "phoneme_ids_len": all_phoneme_len,
                 "prompts": prompt_semantic.astype(np.int64),
                 "bert_feature": bert
             })
@@ -463,6 +461,7 @@ class GPTSoVITS_ONNX_Inference:
                 decoded_semantic_list.append(current_samples)
                 seg_steps += 1
                 if current_samples[0, 0] == 1024:
+                    print(f'{i+1} tokens')
                     break
             t_gpt_dec += time.perf_counter() - t_dec_start
             total_steps += seg_steps
