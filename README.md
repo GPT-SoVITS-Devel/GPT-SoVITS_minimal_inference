@@ -33,12 +33,12 @@ Our goal is simple: **Make GPU go brrr**. We strive for: **Fast AF 🏎️**, **
 
 *Environment: I7 12700 | RTX 2080TI (22G) | CUDA 12.9 | FP16 Precision*
 
-| Metric                      | Native PyTorch(Original Project) | Native PyTorch(This Project) | ONNX        | ONNX Stream | TensorRT             |
+| Metric                      | Native PyTorch(Original Project) | Native PyTorch(This Project) | ONNX        | ONNX Stream | TensorRT (fitted)          |
 |:----------------------------|:---------------------------------|:-----------------------------|:------------|:------------|:---------------------|
 | **First Token Latency (↓)** | 5.417s                           | 2.424 s                      | 2.683 s     | **1.000 s** | 2.022 s              |
 | **Inference Speed (↑)**     | 148.65 tokens/s                  | 144.8 tok/s                  | 172.4 tok/s | 167.5 tok/s | **291.6 tok/s** (🤯) |
 | **RTF (↓)**                 | 0.5229                           | 0.3434                       | 0.3325      | 0.3100      | **0.2096**           |
-| **VRAM Usage (↓)**          | 3 G                              | 2.8 G                        | 3.9 G       | 4.5 G       | 4.8 G                |
+| **VRAM Usage (↓)**          | 3 G                              | 2.8 G                        | 3.9 G       | 4.5 G       | 3.4 G                |
 
 ---
 
@@ -122,25 +122,36 @@ python run_onnx_streaming_inference.py \
 python run_optimized_inference.py --onnx_dir onnx_export/firefly_v2_proplus_fp16 --webui
 ```
 
-### ONNX optimize FP16
-
-```bash
-# onnx下对fp16的加速不太明显,但是对显存优化拥有极大好处
-python onnx_to_fp16.py --input_dir "onnx_export/firefly_v2_proplus" \
-  --output_dir "onnx_export/firefly_v2_proplus_fp16"
-```
-
 ### Export TensorRT Engine
 
 > Note: Compiling TRT engines takes time and must be done for each specific hardware/CUDA/TRT version combination.
 
 ```bash
-```bash
-# Linux
-onnx2trt.sh <onnx_input_dir> <output_dir>
-# Windows
-onnx2trt.bat <onnx_input_dir> <output_dir>
+# Auto-detect GPU VRAM and select optimal shape profile
+python onnx2trt.py \
+    --input_dir onnx_export/firefly_v2_proplus_fp16 \
+    --output_dir onnx_export/firefly_v2_proplus_fp16
+
+# For VRAM-constrained GPUs, use a tighter profile
+python onnx2trt.py \
+    --input_dir onnx_export/firefly_v2_proplus_fp16 \
+    --output_dir onnx_export/firefly_v2_proplus_fp16 \
+    --shape_profile fitted --opt_level 2
+
+# See all options
+python onnx2trt.py --help
 ```
+
+Available shape profiles:
+
+| Profile | sovits max sem | Max audio/seg | Recommended VRAM  |
+|---------|---------------|---------------|-------------------|
+| `small` | 150 | ~6s | <=12GB            |
+| `fitted` | 250 | ~10s | 8-24GB (profiled) |
+| `medium` | 400 | ~16s | 16-24GB (default) |
+| `large` | 1000 | ~40s | >=32GB            |
+
+> Tip: Run inference with ONNX first to collect a **Shape Profile Summary**, then choose the best profile. The `fitted` profile is optimized based on real profiling data.
 
 ---
 

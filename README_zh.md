@@ -33,12 +33,12 @@ KV-Cache optimization, and zero-copy streaming.
 
 *测试模型: GPT-SoVITS V2 PRO PLUS*
 
-| Metric                      | 原生PyTorch(原仓库)  | 原生PyTorch(本仓库) | ONNX        | ONNX Stream | TensorRT             |
+| Metric                      | 原生PyTorch(原仓库)  | 原生PyTorch(本仓库) | ONNX        | ONNX Stream | TensorRT(fitted优化)   |
 |:----------------------------|:----------------|:---------------|:------------|:------------|:---------------------|
 | **First Token Latency (↓)** | 5.417s          | 2.424 s        | 2.683 s     | **1.000 s** | 2.022 s              |
 | **Inference Speed (↑)**     | 148.65 tokens/s | 144.8 tok/s    | 172.4 tok/s | 167.5 tok/s | **291.6 tok/s** (🤯) |
 | **RTF (↓)**                 | 0.5229          | 0.3434         | 0.3325      | 0.3100      | **0.2096**           |
-| **VRAM Usage (↓)**          | 3 G             | 2.8 G          | 3.9 G       | 4.5 G       | 4.8 G                |
+| **VRAM Usage (↓)**          | 3 G             | 2.8 G          | 3.9 G       | 4.5 G       | 3.4 G                |
 
 ---
 
@@ -118,25 +118,36 @@ python run_onnx_streaming_inference.py \
 python run_optimized_inference.py --onnx_dir onnx_export/firefly_v2_proplus_fp16 --webui
 ```
 
-### ONNX 优化FP16
+### 导出 TensorRT Engine
+
+> 编译 TRT 时间较久是正常情况，每台机器在 CUDA/TRT 版本不一致时一定要重新编译！
 
 ```bash
-# onnx下对fp16的加速不太明显,但是对显存优化拥有极大好处
-python onnx_to_fp16.py --input_dir "onnx_export/firefly_v2_proplus" \
-  --output_dir "onnx_export/firefly_v2_proplus_fp16"
+# 自动检测 GPU 显存，选择最优 shape profile
+python onnx2trt.py \
+    --input_dir onnx_export/firefly_v2_proplus_fp16 \
+    --output_dir onnx_export/firefly_v2_proplus_fp16
+
+# 显存紧张，使用更紧凑的 profile
+python onnx2trt.py \
+    --input_dir onnx_export/firefly_v2_proplus_fp16 \
+    --output_dir onnx_export/firefly_v2_proplus_fp16 \
+    --shape_profile fitted --opt_level 2
+
+# 查看所有选项
+python onnx2trt.py --help
 ```
 
-### 导出trt
+可用的 Shape Profile：
 
-> 编译trt时间较久是正常情况,每台机器在cuda/trt版本不一致时一定要重新编译!!!
+| Profile | sovits 最大语义长度 | 单段最长音频 | 推荐显存         |
+|---------|-----------------|------------|--------------|
+| `small` | 150 | ~6秒 | <=12GB       |
+| `fitted` | 250 | ~10秒 | 8-24GB（实测定制） |
+| `medium` | 400 | ~16秒 | 16-24GB（默认）  |
+| `large` | 1000 | ~40秒 | >=32GB       |
 
-```bash
-```bash
-# linux
-onnx2trt.sh <onnx_input_dir> <output_dir>
-# windows
-onnx2trt.bat <onnx_input_dir> <output_dir>
-```
+> 建议：先用 ONNX 推理跑一遍，查看输出的 **Shape Profile Summary**，再选择最合适的 profile。`fitted` profile 是基于真实推理数据优化的最佳选择。
 
 ---
 

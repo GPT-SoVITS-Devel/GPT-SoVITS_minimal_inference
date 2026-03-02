@@ -70,10 +70,44 @@ def sample_topk(topk_values, topk_indices, temperature=1.0):
         samples.append(topk_indices[i, choice])
     return np.array(samples, dtype=np.int64)[:, None]
 
+class ShapeProfiler:
+    """采集推理过程中各模型输入的实际形状，用于调优 TRT shape profile。"""
+
+    def __init__(self):
+        self.records = {}
+
+    def record(self, model_name, tensor_name, shape):
+        key = f"{model_name}.{tensor_name}"
+        if key not in self.records:
+            self.records[key] = []
+        self.records[key].append(tuple(shape) if hasattr(shape, '__iter__') else (shape,))
+
+    def summary(self):
+        if not self.records:
+            return
+        print("\n--- Shape Profile Summary ---")
+        print(f"{'Tensor':<45} | {'Min':>12} | {'Median':>12} | {'P95':>12} | {'Max':>12} | {'Count':>5}")
+        print("-" * 110)
+        for key in sorted(self.records.keys()):
+            shapes = self.records[key]
+            dims = len(shapes[0])
+            for d in range(dims):
+                vals = sorted(s[d] for s in shapes)
+                n = len(vals)
+                p95_idx = min(int(n * 0.95), n - 1)
+                median_idx = n // 2
+                dim_label = f"{key}[dim{d}]"
+                print(f"{dim_label:<45} | {vals[0]:>12} | {vals[median_idx]:>12} | {vals[p95_idx]:>12} | {vals[-1]:>12} | {n:>5}")
+        print("-" * 110)
+        print("Tip: Use P95 as --optShapes and Max as --maxShapes for TRT build.")
+        print("     If Max >> P95, consider clamping max to reduce build VRAM.\n")
+
+
 class GPTSoVITS_ONNX_Inference:
     def __init__(self, onnx_dir, bert_path, device="cpu", gpu_mem_limit=None):
         self.onnx_dir = onnx_dir
         self.device = device
+        self.shape_profiler = ShapeProfiler()
         
         so = onnxruntime.SessionOptions()
         so.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -375,6 +409,11 @@ class GPTSoVITS_ONNX_Inference:
         prompt_semantic = codes[0, 0][None, :]
         t_ref_audio = time.perf_counter() - t_start
 
+        sp = self.shape_profiler
+        sp.record("ssl", "audio_len", [wav16k_padded.shape[1]])
+        sp.record("vq_encoder", "ssl_time", [ssl_content.shape[2]])
+        sp.record("prompt", "semantic_len", [prompt_semantic.shape[1]])
+
         # Text segments
         segments = split_text(text)
         if not segments:
@@ -392,6 +431,10 @@ class GPTSoVITS_ONNX_Inference:
         wav16k_sv = wav16k_sv.astype(self.precision)
         sv_emb = self.run_sess(self.sess_sv_embedding, {"audio": wav16k_sv[None, :]})[0]
 
+        sp.record("spectrogram", "audio_len", [wav_ref.shape[0]])
+        sp.record("spectrogram", "spec_frames", [spec.shape[2]])
+        sp.record("sv_embedding", "audio_len", [wav16k_sv.shape[0]])
+
         #  Process Reference Text (Once)
         t_start = time.perf_counter()
         phones1, bert1, norm_text1 = self.get_phones_and_bert(prompt_text, prompt_lang, self.version)
@@ -407,6 +450,10 @@ class GPTSoVITS_ONNX_Inference:
             all_phoneme_ids = np.array(phones1 + phones2, dtype=np.int64)[None, :]
             all_phoneme_len = np.array([all_phoneme_ids.shape[1]], dtype=np.int64)
             t_text_proc += time.perf_counter() - t_seg_start
+
+            sp.record("gpt_encoder", "phoneme_ids_len", [all_phoneme_ids.shape[1]])
+            sp.record("gpt_encoder", "prompts_len", [prompt_semantic.shape[1]])
+            sp.record("gpt_encoder", "bert_feature_len", [bert.shape[2]])
 
             # GPT Encoder
             t_enc_start = time.perf_counter()
@@ -471,6 +518,11 @@ class GPTSoVITS_ONNX_Inference:
             if generated_sem[0, -1] == 1024: generated_sem = generated_sem[:, :-1]
             generated_sem = generated_sem[:, None, :]
 
+            sp.record("gpt_step", "generated_tokens", [seg_steps])
+            sp.record("sovits", "pred_semantic_len", [generated_sem.shape[2]])
+            sp.record("sovits", "text_seq_len", [len(phones2)])
+            sp.record("sovits", "refer_spec_frames", [spec.shape[2]])
+
             # 5. SoVITS
             t_sov_start = time.perf_counter()
             audio = self.run_sess(self.sess_sovits, {
@@ -521,6 +573,8 @@ class GPTSoVITS_ONNX_Inference:
         print(f"Total Inference Time:  {t_total:.3f}s")
         print(f"Real Time Factor (RTF): {rtf:.4f}")
         print("-------------------------------------------\n")
+
+        self.shape_profiler.summary()
 
 
 if __name__ == "__main__":
