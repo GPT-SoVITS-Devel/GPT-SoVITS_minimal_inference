@@ -93,6 +93,7 @@ class TRTModule:
         self.is_dynamic = {}
         self.tensor_location = {}
         self.tensor_dtype = {}
+        self.input_max_shapes = {}
         
         try:
             self.num_io = self.engine.num_io_tensors
@@ -109,12 +110,24 @@ class TRTModule:
                 self.is_dynamic[name] = any(d < 0 for d in shape)
                 self.tensor_location[name] = self.engine.get_tensor_location(name)
                 self.tensor_dtype[name] = trt_dtype_to_torch(self.engine.get_tensor_dtype(name))
+                if is_input and self.is_dynamic[name]:
+                    try:
+                        _, _, max_shape = self.engine.get_tensor_profile_shape(name, 0)
+                        self.input_max_shapes[name] = tuple(max_shape)
+                    except Exception:
+                        pass
             else:
                 name = self.engine.get_binding_name(i)
                 is_input = self.engine.binding_is_input(i)
                 self.is_dynamic[name] = self.engine.binding_is_variable(i) if hasattr(self.engine, "binding_is_variable") else True
                 self.tensor_location[name] = trt.TensorLocation.DEVICE
                 self.tensor_dtype[name] = trt_dtype_to_torch(self.engine.get_binding_dtype(i))
+                if is_input and self.is_dynamic[name]:
+                    try:
+                        _, _, max_shape = self.engine.get_profile_shape(0, i)
+                        self.input_max_shapes[name] = tuple(max_shape)
+                    except Exception:
+                        pass
             
             if is_input:
                 self.input_names.append(name)
@@ -280,6 +293,20 @@ class GPTSoVITS_TRT_Inference:
 
         self.precision = gpt_enc_dtype
         print(f"Using {self.precision} for inference.")
+
+        self.sovits_max_sem_len = None
+        self.sovits_max_text_len = None
+        self.sovits_max_ref_len = None
+        sovits_max = self.model_sovits.input_max_shapes
+        if "pred_semantic" in sovits_max:
+            self.sovits_max_sem_len = sovits_max["pred_semantic"][-1]
+            print(f"  - SoVITS max pred_semantic: {self.sovits_max_sem_len}")
+        if "text_seq" in sovits_max:
+            self.sovits_max_text_len = sovits_max["text_seq"][-1]
+            print(f"  - SoVITS max text_seq: {self.sovits_max_text_len}")
+        if "refer_spec" in sovits_max:
+            self.sovits_max_ref_len = sovits_max["refer_spec"][-1]
+            print(f"  - SoVITS max refer_spec: {self.sovits_max_ref_len}")
 
         self.warmup()
 
