@@ -167,13 +167,19 @@ If you're tired of staring at the terminal or want your backend to talk to this 
 
 ---
 
+## 🛠️ SDK
+
+C++: [GPT-SoVITS-Devel/GPT-SoVITS-cpp](https://github.com/GPT-SoVITS-Devel/GPT-SoVITS-cpp)
+
+---
+
 ## 🗺️ Roadmap
 
 - [x] **V2 / V2ProPlus** full support
 - [x] **TensorRT** static engine acceleration
 - [x] **Zero-Copy** IOBinding optimization
 - [ ] **Multi-Language Binding**:
-    - [ ] C++ SDK (In development)
+    - [x] C++ SDK (In development)
     - [ ] Rust / Golang / Android Wrapper
 - [ ] **V3 / V4** model adaptation
 - [ ] **Docker** one-click deployment image

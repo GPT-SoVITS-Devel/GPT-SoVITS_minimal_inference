@@ -163,13 +163,19 @@ python onnx2trt.py --help
 
 ---
 
+## 🛠️ SDK
+
+C++: [GPT-SoVITS-Devel/GPT-SoVITS-cpp](https://github.com/GPT-SoVITS-Devel/GPT-SoVITS-cpp)
+
+---
+
 ## 🗺️ 路线图 (Roadmap)
 
 - [x] **V2 / V2ProPlus** 完整支持
 - [x] **TensorRT** 静态引擎加速
 - [x] **Zero-Copy** IOBinding 优化
 - [ ] **Multi-Language Binding**:
-    - [ ] C++ SDK (研发中)
+    - [x] C++ SDK
     - [ ] Rust / Golang / Android Wrapper
 - [ ] **V3 / V4** 模型快速适配
 - [ ] **Docker** 一键部署镜像
