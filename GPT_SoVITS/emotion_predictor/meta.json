@@ -1,0 +1,30 @@
+{
+  "format": "onnx-full",
+  "max_len": 128,
+  "hidden_size": 1024,
+  "num_fuse_layers": 4,
+  "num_labels": 21,
+  "id2label": {
+    "0": "O",
+    "1": "B-happy",
+    "2": "I-happy",
+    "3": "E-happy",
+    "4": "S-happy",
+    "5": "B-doubt",
+    "6": "I-doubt",
+    "7": "E-doubt",
+    "8": "S-doubt",
+    "9": "B-angry",
+    "10": "I-angry",
+    "11": "E-angry",
+    "12": "S-angry",
+    "13": "B-anxious",
+    "14": "I-anxious",
+    "15": "E-anxious",
+    "16": "S-anxious",
+    "17": "B-sad",
+    "18": "I-sad",
+    "19": "E-sad",
+    "20": "S-sad"
+  }
+}

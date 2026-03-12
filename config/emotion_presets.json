@@ -1,0 +1,8 @@
+{
+    "happy": "emotion_refs/happy.wav",
+    "angry": "emotion_refs/angry.wav",
+    "sad": "emotion_refs/sad.wav",
+    "anxious": "emotion_refs/anxious.wav",
+    "doubt": "emotion_refs/doubt.wav",
+    "neutral": "emotion_refs/neutral.wav"
+}
