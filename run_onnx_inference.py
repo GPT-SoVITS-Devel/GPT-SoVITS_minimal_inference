@@ -70,6 +70,32 @@ def sample_topk(topk_values, topk_indices, temperature=1.0):
         samples.append(topk_indices[i, choice])
     return np.array(samples, dtype=np.int64)[:, None]
 
+def apply_repetition_penalty_topk(topk_values, topk_indices, generated_tokens, penalty=1.35):
+    if penalty == 1.0 or len(generated_tokens) == 0:
+        return topk_values
+    topk_values = topk_values.copy()
+    generated_set = set(int(t) for t in generated_tokens)
+    for b in range(topk_values.shape[0]):
+        for k in range(topk_values.shape[1]):
+            if int(topk_indices[b, k]) in generated_set:
+                if topk_values[b, k] < 0:
+                    topk_values[b, k] *= penalty
+                else:
+                    topk_values[b, k] /= penalty
+    return topk_values
+
+def mask_eos_in_topk(topk_values, topk_indices, eos_id=1024):
+    topk_values = topk_values.copy()
+    topk_values[topk_indices == eos_id] = -np.inf
+    return topk_values
+
+def check_eos_argmax_topk(topk_values, topk_indices, eos_id=1024):
+    for b in range(topk_values.shape[0]):
+        argmax_k = np.argmax(topk_values[b])
+        if int(topk_indices[b, argmax_k]) == eos_id:
+            return True
+    return False
+
 class ShapeProfiler:
     """采集推理过程中各模型输入的实际形状，用于调优 TRT shape profile。"""
 
@@ -464,8 +490,13 @@ class GPTSoVITS_ONNX_Inference:
             })
             t_gpt_enc += time.perf_counter() - t_enc_start
 
+            # 重复惩罚 + mask EOS
+            all_prev_tokens = list(prompt_semantic[0].astype(int))
+            topk_values = apply_repetition_penalty_topk(topk_values, topk_indices, all_prev_tokens, penalty=1.35)
+            topk_values = mask_eos_in_topk(topk_values, topk_indices)
             current_samples = sample_topk(topk_values, topk_indices, temperature=temperature)
             decoded_semantic_list = [prompt_semantic, current_samples]
+            all_prev_tokens.append(int(current_samples[0, 0]))
 
             # GPT Step
             t_dec_start = time.perf_counter()
@@ -504,12 +535,27 @@ class GPTSoVITS_ONNX_Inference:
                 outputs = io_binding.get_outputs()
                 topk_values = outputs[0].numpy()
                 topk_indices = outputs[1].numpy()
+
+                # 重复惩罚
+                topk_values = apply_repetition_penalty_topk(topk_values, topk_indices, all_prev_tokens, penalty=1.35)
+
+                # 至少10个token
+                if i + 1 < 11:
+                    topk_values = mask_eos_in_topk(topk_values, topk_indices)
+
+                # 检查argmax EOS
+                eos_by_argmax = check_eos_argmax_topk(topk_values, topk_indices)
+
                 current_samples = sample_topk(topk_values, topk_indices, temperature=temperature)
-                decoded_semantic_list.append(current_samples)
                 seg_steps += 1
-                if current_samples[0, 0] == 1024:
-                    print(f'{i+1} tokens')
+
+                eos_by_sample = (current_samples[0, 0] == 1024)
+                if eos_by_argmax or eos_by_sample:
+                    print(f'{seg_steps} tokens (EOS: argmax={eos_by_argmax}, sample={eos_by_sample})')
                     break
+
+                decoded_semantic_list.append(current_samples)
+                all_prev_tokens.append(int(current_samples[0, 0]))
             t_gpt_dec += time.perf_counter() - t_dec_start
             total_steps += seg_steps
 

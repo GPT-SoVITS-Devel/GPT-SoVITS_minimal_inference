@@ -69,6 +69,32 @@ def sample_topk(topk_values, topk_indices, temperature=1.0):
     
     return samples
 
+def apply_repetition_penalty_topk(topk_values, topk_indices, generated_tokens, penalty=1.35):
+    if penalty == 1.0 or len(generated_tokens) == 0:
+        return topk_values
+    topk_values = topk_values.clone()
+    generated_set = set(int(t) for t in generated_tokens)
+    for b in range(topk_values.shape[0]):
+        for k in range(topk_values.shape[1]):
+            if int(topk_indices[b, k]) in generated_set:
+                if topk_values[b, k] < 0:
+                    topk_values[b, k] *= penalty
+                else:
+                    topk_values[b, k] /= penalty
+    return topk_values
+
+def mask_eos_in_topk(topk_values, topk_indices, eos_id=1024):
+    topk_values = topk_values.clone()
+    topk_values[topk_indices == eos_id] = float('-inf')
+    return topk_values
+
+def check_eos_argmax_topk(topk_values, topk_indices, eos_id=1024):
+    for b in range(topk_values.shape[0]):
+        argmax_k = torch.argmax(topk_values[b])
+        if int(topk_indices[b, argmax_k]) == eos_id:
+            return True
+    return False
+
 def trt_dtype_to_torch(trt_dtype):
     if trt_dtype == trt.float32: return torch.float32
     if trt_dtype == trt.float16: return torch.float16
@@ -559,9 +585,14 @@ class GPTSoVITS_TRT_Inference:
                 x_len = gpt_enc_out["x_len"]
                 y_len = gpt_enc_out["y_len"]
 
+                # 重复惩罚 + mask EOS
+                all_prev_tokens = prompt_semantic[0].tolist()
+                topk_values = apply_repetition_penalty_topk(topk_values, topk_indices, all_prev_tokens, penalty=1.35)
+                topk_values = mask_eos_in_topk(topk_values, topk_indices)
                 current_samples = sample_topk(topk_values, topk_indices, temperature=temperature).to(self.device)
                 prompt_semantic_gpu = prompt_semantic.to(self.device)
                 decoded_semantic_list = [prompt_semantic_gpu, current_samples]
+                all_prev_tokens.append(int(current_samples[0, 0].item()))
 
                 # GPT Step
                 t_dec_start = time.perf_counter()
@@ -599,14 +630,30 @@ class GPTSoVITS_TRT_Inference:
                     }, outputs=step_outputs, sync=False)
                     
                     topk_v, topk_i = step_out["topk_values"].detach().cpu(), step_out["topk_indices"].detach().cpu()
+
+                    # 重复惩罚
+                    topk_v = apply_repetition_penalty_topk(topk_v, topk_i, all_prev_tokens, penalty=1.35)
+
+                    # 至少10个token
+                    if i + 1 < 11:
+                        topk_v = mask_eos_in_topk(topk_v, topk_i)
+
+                    # 检查 argmax EOS
+                    eos_by_argmax = check_eos_argmax_topk(topk_v, topk_i)
+
                     if temperature != 1.0: topk_v = topk_v / temperature
                     probs = torch.softmax(topk_v, dim=-1)
                     indices_of_indices = torch.multinomial(probs, num_samples=1)
                     current_samples = torch.gather(topk_i, -1, indices_of_indices).to(self.device)
-                    
-                    decoded_semantic_list.append(current_samples)
+
                     seg_steps += 1
-                    if current_samples[0, 0] == 1024: break
+                    eos_by_sample = (current_samples[0, 0] == 1024)
+                    if eos_by_argmax or eos_by_sample:
+                        print(f'{seg_steps} tokens (EOS: argmax={eos_by_argmax}, sample={eos_by_sample})')
+                        break
+
+                    decoded_semantic_list.append(current_samples)
+                    all_prev_tokens.append(int(current_samples[0, 0].item()))
                 
                 if self.device.type == "cuda": torch.cuda.synchronize()
                 t_gpt_dec += time.perf_counter() - t_dec_start
