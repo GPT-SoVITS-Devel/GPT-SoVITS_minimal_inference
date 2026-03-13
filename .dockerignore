@@ -1,5 +1,6 @@
 .git
 .gitignore
+.github
 docker-compose.yml
 __pycache__
 venv/
